@@ -1,0 +1,19 @@
+name: mmhf
+channels:
+  - conda-forge
+  - http://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/msys2
+  - http://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/pro
+  - http://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r
+  - http://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free
+  - http://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch-cuda=12.4
+  - pytorch==2.4.1
+  - torchaudio==2.4.1
+  - torchvision==0.19.1
+  - ipykernel
+prefix: C:\anaconda\envs\mmhf
