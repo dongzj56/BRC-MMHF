@@ -6,7 +6,7 @@
   "tabular_emb" : "../models/tabular_emb.csv",
   "AAL_dir": "E:/adni_dataset/AAL_space-MNI152NLin6_res-2x2x2.nii/AAL_space-MNI152NLin6_res-2x2x2.nii",
   "table_startcol": 3,
-  "task": "ADCN",
+  "task": "SMCIPMCI",
   "augment": true,
   "split_ratio_test": 0.2,
   "seed": 42,
