@@ -49,50 +49,59 @@ class ImageEncoder_CEN(nn.Module):
         in_ch_modality: int = 1,
         level_channels: list[int] = [64, 128, 256],
         bottleneck_ch: int = 512,
-        share_layers: int = 2,             # 共享前几层
-        cen_ratios: tuple[float, ...] = (0.2, 0.1)   # 每层交换比例
+        share_layers: int = 2,
+        cen_ratios: tuple[float, ...] = (0.2, 0.1),
+        share_scheme: str = "early"
     ):
         super().__init__()
-        assert share_layers == len(cen_ratios), \
-            "len(cen_ratios) 必须等于 share_layers"
+        assert share_scheme in ("early", "bottleneck")
+        if share_scheme == "early":
+            assert share_layers == len(cen_ratios)
 
         l1, l2, l3 = level_channels
 
-        # ─── 动态构建共享 + CEN 层 ───
+        self.share_scheme = share_scheme
         self.shared_blocks = nn.ModuleList()
-        in_out_pairs = [
-            (in_ch_modality, l1),
-            (l1, l2),
-            (l2, l3)
-        ]
-        for i in range(share_layers):
-            ic, oc = in_out_pairs[i]
-            ratio = cen_ratios[i]
-            self.shared_blocks.append(
-                SharedConv3DBlock(ic, oc, half_ratio=ratio)
-            )
+        self.shared_bneck = None
+        if share_scheme == "early":
+            in_out_pairs = [
+                (in_ch_modality, l1),
+                (l1, l2),
+                (l2, l3)
+            ]
+            for i in range(share_layers):
+                ic, oc = in_out_pairs[i]
+                ratio = cen_ratios[i]
+                self.shared_blocks.append(
+                    SharedConv3DBlock(ic, oc, half_ratio=ratio)
+                )
+            last_out = [l1, l2, l3][share_layers - 1]
+        else:
+            last_out = l2
+            b_ratio = cen_ratios[-1] if len(cen_ratios) > 0 else 0.2
+            self.shared_bneck = SharedConv3DBlock(l3, bottleneck_ch, half_ratio=b_ratio, with_pool=False)
 
-        last_out = [l1, l2, l3][share_layers - 1]
-
-        # ─── 深层独立编码 ───
         self.mri_block3 = Conv3DBlock(last_out, l3)
         self.pet_block3 = Conv3DBlock(last_out, l3)
-        self.mri_bneck = Conv3DBlock(l3, bottleneck_ch, bottleneck=True)
-        self.pet_bneck = Conv3DBlock(l3, bottleneck_ch, bottleneck=True)
+        if share_scheme == "early":
+            self.mri_bneck = Conv3DBlock(l3, bottleneck_ch, bottleneck=True)
+            self.pet_bneck = Conv3DBlock(l3, bottleneck_ch, bottleneck=True)
 
         # ─── 全局池化 ───
         self.gap = nn.AdaptiveAvgPool3d(1)
 
     def forward(self, mri: torch.Tensor, pet: torch.Tensor):
-        # ----- Shared layers + CEN -----
-        for blk in self.shared_blocks:
-            mri, pet, _, _ = blk(mri, pet)
-
-        # ----- Private deep layers -----
-        mri, _ = self.mri_block3(mri)
-        pet, _ = self.pet_block3(pet)
-        mri, _ = self.mri_bneck(mri)
-        pet, _ = self.pet_bneck(pet)
+        if self.share_scheme == "early":
+            for blk in self.shared_blocks:
+                mri, pet, _, _ = blk(mri, pet)
+            mri, _ = self.mri_block3(mri)
+            pet, _ = self.pet_block3(pet)
+            mri, _ = self.mri_bneck(mri)
+            pet, _ = self.pet_bneck(pet)
+        else:
+            mri, _ = self.mri_block3(mri)
+            pet, _ = self.pet_block3(pet)
+            mri, pet, _, _ = self.shared_bneck(mri, pet)
 
         # ----- 特征向量提取 -----
         vm = self.gap(mri).flatten(1)  # [B, bottleneck_ch]
