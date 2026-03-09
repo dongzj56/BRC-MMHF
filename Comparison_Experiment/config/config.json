@@ -3,7 +3,7 @@
   "mri_dir": "E:/adni_dataset/MRI",
   "pet_dir": "E:/adni_dataset/PET",
   "table_dir": "E:/adni_dataset/ADNI_Tabel.csv",
-  "tabular_emb" : "../models/tabular_emb.csv",
+  "tabular_emb" : "../model_tabular/models/tabular_emb.csv",
   "AAL_dir": "E:/adni_dataset/AAL_space-MNI152NLin6_res-2x2x2.nii/AAL_space-MNI152NLin6_res-2x2x2.nii",
   "table_startcol": 3,
   "task": "SMCIPMCI",

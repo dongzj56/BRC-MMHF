@@ -1,7 +1,4 @@
-conda create -n mmhf python=3.10
-
 torch==2.4.1
-
 tqdm==4.67.1
 monai==1.4.0
 pandas==2.2.3
@@ -13,5 +10,3 @@ nibabel==5.3.2
 SimpleITK==2.5.0
 nilearn==0.11.1
 torchsummary==1.5.1
-
-pip install nibabel SimpleITK monai tensorboard tqdm pandas scikit-learn numpy matplotlib nilearn torchsummary thop

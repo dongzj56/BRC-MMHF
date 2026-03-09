@@ -8,25 +8,22 @@ from monai.data import Dataset as MonaiDataset
 from sklearn.model_selection import StratifiedKFold
 from utils.metrics import calculate_metrics
 from datasets.ADNI import ADNI, ADNI_transform
-from models.mmad_encoder import ImageEncoder_CEN, MultiModalClassifier
-from models.unet3d import UNet3D_Feature
+from models.mmad_encoder import ImageEncoder_CEN
+from models.cen_unet import CEN_DualUNet3D, TabularEncoder
 from models.ROI_pol import ROIPooling3D
 from models.HGNN import DualModalHyperGraphWithAttn
 from utils.losses import compute_class_weights, make_loss
-
 
 # Configuration load
 def load_cfg(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
 class Cfg:
     def __init__(self, d):
         for k, v in d.items():
             setattr(self, k, v)
         self.device = torch.device(self.device if torch.cuda.is_available() and str(self.device).startswith("cuda") else "cpu")
-
 
 # Data Load
 def build_fold_indices(cfg, data_dict):
@@ -49,13 +46,11 @@ def build_fold_indices(cfg, data_dict):
         json.dump(result, f, indent=2)
     return result
 
-
 def load_fold_indices(json_path, fold):
     with open(json_path, "r", encoding="utf-8") as f:
         all_indices = json.load(f)
     d = all_indices[str(fold)]
     return d["train_idx"], d["val_idx"], d["test_idx"]
-
 
 # DataLoader Build
 def get_dataloaders(cfg, full_ds, fold):
@@ -70,7 +65,6 @@ def get_dataloaders(cfg, full_ds, fold):
     loader_te = DataLoader(ds_test, batch_size=cfg.batch_size, shuffle=False, num_workers=0, pin_memory=True)
     return loader_tr, loader_val, loader_te
 
-
 # Table embedding loading and mapping
 def load_table_embeddings(csv_path):
     df = pd.read_csv(csv_path)
@@ -78,7 +72,6 @@ def load_table_embeddings(csv_path):
     dim = len(cols)
     mapping = {row["Subject_ID"]: row[cols].astype(np.float32).values for _, row in df.iterrows()}
     return mapping, dim
-
 
 def get_table_tensor(subject_ids, table_map, tab_dim, device):
     vecs = []
@@ -90,27 +83,55 @@ def get_table_tensor(subject_ids, table_map, tab_dim, device):
     arr = np.stack(vecs, axis=0)
     return torch.from_numpy(arr).to(device)
 
-
 # Model creation: Image encoder and multimodal classifier
+class HyperGraphImageModel(nn.Module):
+    def __init__(self, cfg_local):
+        super().__init__()
+        # Use CEN-enabled Dual Stream U-Net
+        # Assuming level_channels=[64, 128, 256], l1=64 matches HGNN in_dim
+        # num_classes=2 enables segmentation head for auxiliary loss (Background vs Brain/ROI)
+        self.unet = CEN_DualUNet3D(
+            in_channels=1,
+            num_classes=2, 
+            level_channels=[64, 128, 256],
+            bottleneck_channel=512,
+            share_layers=2,
+            cen_ratios=(0.2, 0.1)
+        ).to(cfg_local.device)
+        
+        self.pool = ROIPooling3D(cfg_local.AAL_dir).to(cfg_local.device)
+        ks = getattr(cfg_local, "hg_ks", {0: (6, 18), 1: (6, 18)})
+        
+        # HGNN takes ROI features (dim=64)
+        self.hg = DualModalHyperGraphWithAttn(
+            in_dim=64, 
+            hidden_dim=128, 
+            num_layers=2, 
+            ks=ks,
+            dk=64
+        ).to(cfg_local.device)
+
+    def forward(self, mri, pet):
+        # Extract feature maps with CEN interaction
+        # Returns features and segmentation logits
+        fm, fp, seg_m, seg_p = self.unet(mri, pet)
+        
+        # ROI Pooling to get node features
+        rm = self.pool(fm)   # [B, R, 64]
+        rp = self.pool(fp)
+        
+        # Hypergraph Fusion (Dynamic & Lesion Aware via Attention)
+        out = self.hg(rm, rp)
+        
+        # Global aggregation
+        v = torch.cat([out["global_mod1"], out["global_mod2"]], dim=1)  # [B, 128]
+        
+        # Return global vector and segmentation logits for aux loss
+        return v, seg_m, seg_p
+
 def generate_image_model(cfg):
     model_type = getattr(cfg, "model_type", "cen")
     if model_type == "hypergraph":
-        class HyperGraphImageModel(nn.Module):
-            def __init__(self, cfg_local):
-                super().__init__()
-                self.unet_mri = UNet3D_Feature(in_channels=1).to(cfg_local.device).eval()
-                self.unet_pet = UNet3D_Feature(in_channels=1).to(cfg_local.device).eval()
-                self.pool = ROIPooling3D(cfg_local.AAL_dir).to(cfg_local.device).eval()
-                ks = getattr(cfg_local, "hg_ks", {0: (6, 18), 1: (6, 18)})
-                self.hg = DualModalHyperGraphWithAttn(in_dim=64, hidden_dim=128, num_layers=2, ks=ks).to(cfg_local.device).eval()
-            def forward(self, mri, pet):
-                fm = self.unet_mri(mri)
-                fp = self.unet_pet(pet)
-                rm = self.pool(fm)   # [B,R,64]
-                rp = self.pool(fp)
-                out = self.hg(rm, rp)
-                v = torch.cat([out["global_mod1"], out["global_mod2"]], dim=1)  # [B,128]
-                return v
         return HyperGraphImageModel(cfg)
     else:
         model = ImageEncoder_CEN(
@@ -123,6 +144,31 @@ def generate_image_model(cfg):
         ).to(cfg.device)
         return model
 
+class MultiModalClassifier(nn.Module):
+    """
+    Classifier with Tabular Encoder (MLP)
+    """
+    def __init__(self, img_dim, tab_dim, num_classes):
+        super().__init__()
+        self.img_dim = img_dim
+        self.tab_dim = tab_dim
+        
+        # Lightweight Tabular Encoder
+        self.tab_encoder = TabularEncoder(input_dim=tab_dim, output_dim=64)
+        
+        self.fc = nn.Sequential(
+            nn.Linear(img_dim + 64, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, img_feat, table_feat):
+        # Encode tabular data
+        tab_emb = self.tab_encoder(table_feat)
+        # Concatenate
+        x = torch.cat([img_feat, tab_emb], dim=1)
+        return self.fc(x)
 
 def generate_mm_classifier(cfg, img_dim, tab_dim):
     model = MultiModalClassifier(
@@ -132,30 +178,53 @@ def generate_mm_classifier(cfg, img_dim, tab_dim):
     ).to(cfg.device)
     return model
 
- 
-
-# ---- 单轮训练/验证 ----------------------------------------------------------
+# Single-fold training/validation
 def epoch_run(loader, img_encoder, clf_model, optimizer, scaler, criterion, device, table_map, tab_dim, fp16):
     is_train = optimizer is not None
     if is_train:
         clf_model.train()
-        img_encoder.eval()
+        img_encoder.train()
     else:
         clf_model.eval()
         img_encoder.eval()
     loss_sum = 0.0
     y_true_all, y_pred_all, y_prob_all = [], [], []
+    
+    # Auxiliary Loss (Segmentation) - Placeholder since dataset lacks masks
+    # If masks were available, we would use DiceLoss or CrossEntropy
+    seg_criterion = nn.CrossEntropyLoss() 
+    
     for batch in loader:
         mri = batch["MRI"].to(device)
         pet = batch["PET"].to(device)
         label = batch["label"].to(device).long()
         subjects = batch.get("Subject", [""] * mri.size(0))
         table = get_table_tensor(subjects, table_map, tab_dim, device).float()
+        
+        # Check if segmentation mask exists (Placeholder)
+        seg_mask = batch.get("seg_mask") # Currently None from ADNI dataset
+        if seg_mask is not None:
+            seg_mask = seg_mask.to(device).long()
+
         with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
                       enabled=bool(fp16 and torch.cuda.is_available())):
-            img_feat = img_encoder(mri, pet)
+            # Forward pass
+            if isinstance(img_encoder, HyperGraphImageModel):
+                img_feat, seg_m, seg_p = img_encoder(mri, pet)
+            else:
+                img_feat = img_encoder(mri, pet)
+                seg_m, seg_p = None, None
+            
             logits = clf_model(img_feat, table)
-            loss = criterion(logits, label)
+            cls_loss = criterion(logits, label)
+            
+            # Add auxiliary segmentation loss if masks available
+            loss = cls_loss
+            if seg_mask is not None and seg_m is not None:
+                loss_seg_m = seg_criterion(seg_m, seg_mask)
+                loss_seg_p = seg_criterion(seg_p, seg_mask)
+                loss += 0.1 * (loss_seg_m + loss_seg_p) # Weight 0.1 as per common practice
+                
         if is_train:
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None and bool(fp16):
@@ -175,15 +244,18 @@ def epoch_run(loader, img_encoder, clf_model, optimizer, scaler, criterion, devi
     metrics = calculate_metrics(y_true_all, y_pred_all, y_prob_all)
     return epoch_loss, metrics
 
-
-# ---- 单折训练：记录指标并保存最佳检查点 --------------------------------------
+# Single-fold training: Record metrics and save the best checkpoint
 def train_fold(cfg, fold, loaders, table_map, tab_dim):
     device = cfg.device
     img_encoder = generate_image_model(cfg)
     model_type = getattr(cfg, "model_type", "cen")
     img_dim = 128 if model_type == "hypergraph" else 1024
     clf_model = generate_mm_classifier(cfg, img_dim=img_dim, tab_dim=tab_dim)
-    optimizer = torch.optim.AdamW(clf_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    
+    # Train both Image Encoder and Classifier (End-to-End)
+    params = list(img_encoder.parameters()) + list(clf_model.parameters())
+    optimizer = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    
     train_labels = [d["label"] for d in loaders[0].dataset.data]
     nb_class = int(getattr(cfg, "nb_class", 2))
     class_weights = compute_class_weights(train_labels, num_classes=nb_class).to(device)
@@ -211,8 +283,7 @@ def train_fold(cfg, fold, loaders, table_map, tab_dim):
         print(f"Fold {fold} Epoch {epoch} | train AUC={tr_metrics['AUC']:.4f} val AUC={vl_metrics['AUC']:.4f} | {t1 - t0:.1f}s")
     return {"img_encoder": img_encoder, "clf_model": clf_model}, best_path, best_auc
 
-
-# ---- 单折推理：加载最佳权重并评估 -------------------------------------------
+# Single-fold inference: Load the best checkpoint and evaluate
 @torch.no_grad()
 def infer_fold(cfg, fold, test_loader, table_map, tab_dim, ckpt_path):
     device = cfg.device
@@ -234,7 +305,10 @@ def infer_fold(cfg, fold, test_loader, table_map, tab_dim, ckpt_path):
         table = get_table_tensor(subjects, table_map, tab_dim, device).float()
         with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
                       enabled=bool(cfg.fp16 and torch.cuda.is_available())):
-            img_feat = img_encoder(mri, pet)
+            if isinstance(img_encoder, HyperGraphImageModel):
+                img_feat, _, _ = img_encoder(mri, pet)
+            else:
+                img_feat = img_encoder(mri, pet)
             logits = clf_model(img_feat, table)
         probs = torch.softmax(logits, dim=1)[:, 1].float()
         preds = (probs > 0.5).int()
@@ -244,8 +318,7 @@ def infer_fold(cfg, fold, test_loader, table_map, tab_dim, ckpt_path):
     metrics = calculate_metrics(y_true, y_pred, y_prob)
     return metrics, y_true, y_pred, y_prob
 
-
-# ---- 主流程：配置加载 → 划分 → 训练 → 测试 → 汇总 ---------------------------
+# Main workflow: Config loading → Splitting → Training → Testing → Summarizing  
 def main():
     env_cfg = os.environ.get("MMHF_CONFIG")
     candidates = []
@@ -256,6 +329,7 @@ def main():
     chosen = None
     for p in candidates:
         if not os.path.exists(p):
+            print(f"[Config] Skipping {p}: file not found")
             continue
         cfg_try = Cfg(load_cfg(p))
         if os.path.exists(cfg_try.label_file):
@@ -263,8 +337,10 @@ def main():
             cfg = cfg_try
             print(f"[Config] Using {p}")
             break
+        else:
+            print(f"[Config] Skipping {p}: label_file '{cfg_try.label_file}' not found")
     if chosen is None:
-        raise FileNotFoundError("配置文件有效路径未找到：请设置 MMHF_CONFIG 指向包含可访问 label_file 的配置，或修正 config/config*.json 中的数据路径")
+        raise FileNotFoundError("Valid configuration file path not found: Please set MMHF_CONFIG to point to a configuration containing an accessible label_file, or correct the data paths in config/config*.json")
     full_dataset = ADNI(cfg.label_file, cfg.mri_dir, cfg.pet_dir, cfg.task, cfg.augment)
     full_ds = full_dataset.data_dict
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
@@ -300,7 +376,6 @@ def main():
     for k in keys:
         vals = [m[k] for m in all_metrics]
         print(f"{k}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
-
 
 if __name__ == "__main__":
     main()

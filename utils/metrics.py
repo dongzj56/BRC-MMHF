@@ -3,7 +3,6 @@ from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              f1_score, roc_auc_score, matthews_corrcoef,
                              confusion_matrix, roc_curve, auc)
 
-# ----------------- 指标函数 -------------------
 def calculate_metrics(y_true, y_pred, y_score):
     if len(y_true) == 0:
         raise ValueError("No samples to evaluate. Please check your test_loader / data split.")

@@ -1,3 +1,11 @@
+"""
+Purpose: Adaptive intensity normalization for medical images.
+This function performs percentile-based normalization by:
+- Filtering non-negative voxels
+- Computing lower/upper percentile values
+- Normalizing to zero mean and unit half-range
+- Clamping the output to [-1, 1]
+"""
 import os
 from monai.transforms import (
     Compose,
@@ -17,35 +25,35 @@ from os.path import join
 import os
 
 
-def adaptive_normal(img):  # 定义一个名为adaptive_normal的函数，接收一个图像数组作为输入参数
-    min_p = 0.001  # 设置最小分位点（1%的像素值）
-    max_p = 0.999  # 设置最大分位点（99%的像素值），这些分位数决定了归一化的范围
+def adaptive_normal(img):  # Define a function named adaptive_normal that takes an image array as input
+    min_p = 0.001  # Minimum percentile (controls lower bound of normalization)
+    max_p = 0.999  # Maximum percentile (controls upper bound of normalization)
 
-    imgArray = img  # 将输入图像赋值给imgArray变量，作为后续的处理对象
-    imgPixel = imgArray[imgArray >= 0]  # 过滤掉图像中小于0的像素值（可能是无效值或背景）
-    imgPixel, _ = torch.sort(imgPixel)  # 对过滤后的像素值进行排序，_表示不使用排序后的索引
+    imgArray = img  # Assign the input image to imgArray for subsequent processing
+    imgPixel = imgArray[imgArray >= 0]  # Filter out pixel values below 0 (often invalid or background)
+    imgPixel, _ = torch.sort(imgPixel)  # Sort filtered pixels; discard indices
 
-    # 计算最小分位数值对应的像素索引
-    index = int(round(len(imgPixel) - 1) * min_p + 0.5)  # 计算最小分位数的位置
-    if index < 0:  # 防止索引越界
+    # Compute the index corresponding to the lower percentile value
+    index = int(round(len(imgPixel) - 1) * min_p + 0.5)  # Position of the lower percentile
+    if index < 0:  # Prevent out-of-range index
         index = 0
-    if index > (len(imgPixel) - 1):  # 防止索引越界
+    if index > (len(imgPixel) - 1):  # Prevent out-of-range index
         index = len(imgPixel) - 1
-    value_min = imgPixel[index]  # 获取最小分位值
+    value_min = imgPixel[index]  # Lower percentile value
 
-    # 计算最大分位数值对应的像素索引
-    index = int(round(len(imgPixel) - 1) * max_p + 0.5)  # 计算最大分位数的位置
-    if index < 0:  # 防止索引越界
+    # Compute the index corresponding to the upper percentile value
+    index = int(round(len(imgPixel) - 1) * max_p + 0.5)  # Position of the upper percentile
+    if index < 0:  # Prevent out-of-range index
         index = 0
-    if index > (len(imgPixel) - 1):  # 防止索引越界
+    if index > (len(imgPixel) - 1):  # Prevent out-of-range index
         index = len(imgPixel) - 1
-    value_max = imgPixel[index]  # 获取最大分位值
+    value_max = imgPixel[index]  # Upper percentile value
 
-    mean = (value_max + value_min) / 2.0  # 计算归一化的均值，即最大值与最小值的平均值
-    stddev = (value_max - value_min) / 2.0  # 计算归一化的标准差，即最大值与最小值的差的一半
+    mean = (value_max + value_min) / 2.0  # Normalization mean: average of upper and lower values
+    stddev = (value_max - value_min) / 2.0  # Normalization scale: half of the range
 
-    imgArray = (imgArray - mean) / stddev  # 对图像数组进行归一化，使其均值为0，标准差为1
-    imgArray[imgArray < -1] = -1.0  # 将归一化后小于-1的像素值限制为-1
-    imgArray[imgArray > 1] = 1.0  # 将归一化后大于1的像素值限制为1
+    imgArray = (imgArray - mean) / stddev  # Normalize the image to zero mean and unit half-range
+    imgArray[imgArray < -1] = -1.0  # Clamp values below -1 to -1
+    imgArray[imgArray > 1] = 1.0  # Clamp values above 1 to 1
 
-    return imgArray  # 返回归一化后的图像数组
+    return imgArray  # Return the normalized image array

@@ -280,3 +280,70 @@ class CrossTransformer_MOD_AVG(nn.Module):
         cls_token = torch.cat([mri_cls_avg,  pet_cls_avg, mri_cls_max, pet_cls_max], dim=1)
         return cls_token
 
+
+def test_network_architecture():
+    import torch.optim as optim
+    # --------------- 2. Global Pooling (avg or max) ---------------
+    # If the input is [B, C, D, H, W], we want to turn it into [B, C]
+    # Use AdaptiveAvgPool3d(1) -> [B, C, 1, 1, 1] -> flatten -> [B, C]
+    global_pool = nn.AdaptiveAvgPool3d(1)
+    # global_pool = nn.AdaptiveMaxPool3d(1)
+
+    # --------------- 3. Classification Head (MLP) ---------------
+    # Input dimension: d_model (from Transformer) or C (from CNN)
+    # Output dimension: num_classes
+    head = nn.Sequential(
+        nn.Linear(d_model, 64),
+        nn.ReLU(),
+        nn.Dropout(0.2),
+        nn.Linear(64, num_classes)
+    )
+
+    # --------------- 4. Forward Propagation Simulation ---------------
+    print("--- Forward Simulation ---")
+
+    # (A) Feature Extraction (CNN)
+    features = cnn_backbone(dummy_input)  # [B, C, D', H', W']
+    print(f"CNN Output shape: {features.shape}")
+
+    # (B) Feature Transformation (Pooling or Flattening)
+    # 1. Direct Global Pooling
+    pooled = global_pool(features).flatten(1) # [B, C]
+    print(f"Global Pooled shape: {pooled.shape}")
+
+    # 2. Or adjust dimensions for Transformer: [B, C, D, H, W] -> [B, S, E]
+    # where E=C (embedding dim), S=D*H*W (sequence length)
+    B, C, D, H, W = features.shape
+    # Permute to [B, D, H, W, C] then flatten spatial dims -> [B, D*H*W, C]
+    seq_input = features.permute(0, 2, 3, 4, 1).contiguous().view(B, -1, C)
+    print(f"Transformer Input shape: {seq_input.shape}")
+
+    # (C) Cross Attention (Transformer)
+    # Assume we have a 'query' vector, e.g., a learnable class token or another modality feature
+    # Here we simulate a random query [B, 1, C]
+    query = torch.randn(B, 1, C)
+    attn_output, _ = transformer_block(query, seq_input, seq_input)
+    # attn_output shape: [B, 1, C]
+    print(f"Transformer Output shape: {attn_output.shape}")
+
+    # Remove sequence dimension -> [B, C]
+    feat_vector = attn_output.squeeze(1)
+
+    # (D) Classification
+    logits = head(feat_vector)
+    print(f"Logits shape: {logits.shape}")  # [B, num_classes]
+
+    # --------------- 5. Loss & Optimizer (Example) ---------------
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(list(cnn_backbone.parameters()) +
+                           list(transformer_block.parameters()) +
+                           list(head.parameters()), lr=1e-4)
+
+    print("\n--- Model Setup Complete ---")
+    print(cnn_backbone)
+    print(transformer_block)
+    print(head)
+
+if __name__ == "__main__":
+    test_network_architecture()
+

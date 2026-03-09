@@ -10,12 +10,12 @@ class DilatedDenseBottleneck(nn.Module):
         super(DilatedDenseBottleneck, self).__init__()
         planes = expansion * growthRate
 
-        # 1×1 变维
+        # 1x1 dimension change
         self.bn1 = nn.BatchNorm2d(inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
 
-        # 膨胀深度可分离卷积
+        # Dilated depthwise separable convolution
         padding = ((kernel_size - 1) // 2) * dilation
         self.depthwise = nn.Conv2d(planes, planes, kernel_size=kernel_size,
                                    padding=padding, groups=planes,
@@ -27,12 +27,12 @@ class DilatedDenseBottleneck(nn.Module):
     def forward(self, x):
         out = self.relu(self.bn1(x))
         out = self.conv1(out)
-        out = self.relu(self.bn1(out))  # 再次 BN+ReLU
+        out = self.relu(self.bn1(out))  # BN+ReLU again
         out = self.depthwise(out)
         out = self.pointwise(out)
         if self.dropRate > 0:
             out = F.dropout(out, p=self.dropRate, training=self.training)
-        # 融合新旧特征
+        # Fuse new and old features
         return torch.cat([x, out], dim=1)
 
 
@@ -62,7 +62,7 @@ class DilatedDenseNet(nn.Module):
                  large_kernel_head=True):
         super(DilatedDenseNet, self).__init__()
 
-        # 初始通道数
+        # Initial channel count
         self.inplanes = growthRate * 2
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(3, 2, 1)
@@ -87,18 +87,18 @@ class DilatedDenseNet(nn.Module):
             # Dense block
             block = self._make_block(num, kernel_sizes[idx], dilations[idx], dropRate)
             self.blocks.append(block)
-            # Transition（最后一个 block 后不加）
+            # Transition (not added after the last block)
             if idx != len(layers) - 1:
                 trans_planes = self.inplanes // compression
                 self.blocks.append(Transition(self.inplanes, trans_planes))
                 self.inplanes = trans_planes
 
-        # 分类头
+        # Classification head
         self.bn_last = nn.BatchNorm2d(self.inplanes)
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(self.inplanes, num_classes)
 
-        # 权重初始化
+        # Weight initialization
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels

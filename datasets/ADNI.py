@@ -1,3 +1,12 @@
+"""
+Purpose: ADNI dataset loader and preprocessing utilities.
+This module:
+- Loads labels from ADNI CSV and maps groups to task-specific class ids
+- Builds a data dictionary with MRI/PET NIfTI paths and subject ids
+- Provides MONAI transforms to normalize intensity and pad both MRI/PET
+  to a unified size of (96, 112, 96), with optional augmentation
+- Offers simple dataset info printing helpers
+"""
 import os
 import pandas as pd
 from torch.utils.data import Dataset,DataLoader, Subset
@@ -11,7 +20,7 @@ from monai.transforms import (
     RandFlipd, RandRotated, RandZoomd, SpatialPadd, Compose
 )
 
-# 定义数据类
+# Dataset class definition
 class ADNI(Dataset):
     def __init__(self, label_file, mri_dir, pet_dir,task='ADCN', augment=False):
         # self.label = pd.read_csv(label_file)
@@ -26,7 +35,7 @@ class ADNI(Dataset):
         self._print_class_counts()
 
     def _process_labels(self):
-        """根据指定的任务从标签 CSV 文件中提取数据标签"""
+        """Extract labels from the CSV according to the specified task."""
         if self.task == 'ADCN':
             self.labels = self.label[(self.label['Group'] == 'AD') | (self.label['Group'] == 'CN')]
             self.label_dict = {'CN': 0, 'AD': 1}
@@ -47,10 +56,10 @@ class ADNI(Dataset):
         ]
 
     def _print_class_counts(self):
-        """打印当前 data_dict 里每个 label 的样本数量。"""
+        """Print sample counts per label in the current data_dict."""
         inv = {v: k for k, v in self.label_dict.items()}
         cnt = Counter(sample['label'] for sample in self.data_dict)
-        print(f"\n[ADNI Dataset: {self.task}] 样本分布：")
+        print(f"\n[ADNI Dataset: {self.task}] Sample distribution:")
         for lbl_value, num in cnt.items():
             print(f"  {inv[lbl_value]} ({lbl_value}): {num}")
         print()
@@ -59,11 +68,11 @@ class ADNI(Dataset):
         return len(self.data_dict)
 
     def __getitem__(self, idx):
-        """仅返回MRI图像和标签"""
+        """Return MRI, PET and label tensors for a given index."""
         sample = self.data_dict[idx]
         label = sample['label']
 
-        # 加载MRI图像
+        # Load MRI/PET images
         mri_img = LoadImaged(keys=['MRI'])({'MRI': sample['MRI']})['MRI']
         pet_img = LoadImaged(keys=['PET'])({'PET': sample['PET']})['PET']
         return mri_img, pet_img, label
@@ -88,10 +97,10 @@ class ADNI(Dataset):
         print(df)
         print(f"{'=' * 40}\n")
 
-# 修改预处理函数，仅处理MRI数据
+# Preprocessing: MRI & PET unified padding, normalization, optional augmentation
 def ADNI_transform(augment=False):
-    keys = ['MRI','PET']  # 统一管理数据键
-    pad_size = (96, 112, 96)  # 目标尺寸
+    keys = ['MRI','PET']  # unified keys for both modalities
+    pad_size = (96, 112, 96)  # target size
 
     base_transforms = [
         LoadImaged(keys=keys),
@@ -107,27 +116,27 @@ def ADNI_transform(augment=False):
         base_transforms.insert(5, RandZoomd(keys=keys, prob=0.3, min_zoom=0.95, max_zoom=1))
 
     train_transform = Compose(base_transforms)
-    test_transform  = Compose(base_transforms[:5])  # 不含增强，仅标准化+Pad
+    test_transform  = Compose(base_transforms[:5])  # no augmentation; normalization + padding only
 
     return train_transform, test_transform
 
 
 def main():
-    # ------------- 基本路径与任务 -------------
-    label_filename  = rf'C:\Users\dongzj\Desktop\Multimodal_AD\adni_dataset\ADNI_902.csv'
-    mri_dir         = rf'C:\Users\dongzj\Desktop\Multimodal_AD\adni_dataset\MRI'
-    pet_dir         = rf'C:\Users\dongzj\Desktop\Multimodal_AD\adni_dataset\PET'
-    task            = 'ADCN'        # 四分类
+    # ------------- Basic paths and task -------------
+    label_filename  = rf'adni_dataset\ADNI_902.csv'
+    mri_dir         = rf'adni_dataset\MRI'
+    pet_dir         = rf'adni_dataset\PET'
+    task            = 'SMCIPMCI'        # two-class subset (AD vs CN / SMCI vs PMCI)
 
-    # ------------- 1) 只创建一次完整数据集 -------------
+    # ------------- 1) Build the full dataset once -------------
     full_dataset = ADNI(
         label_file=label_filename,
         mri_dir=mri_dir,
         pet_dir=pet_dir,
         task=task
-    )   # 这里会自动打印一次样本分布
+    )   # prints sample distribution automatically
 
-    # ------------- 2) 分层划分索引 -------------
+    # ------------- 2) Stratified index split -------------
     indices = list(range(len(full_dataset)))
     labels  = [full_dataset.data_dict[i]['label'] for i in indices]
 
@@ -135,20 +144,19 @@ def main():
         indices,
         test_size=0.2,
         random_state=42,
-        stratify=labels           # 保证四个类别比例一致
+        stratify=labels           # keep label ratio consistent
     )
 
-    # ------------- 3) 构建子集 -------------
+    # ------------- 3) Build subsets -------------
     train_dataset = Subset(full_dataset, train_idx)
     test_dataset  = Subset(full_dataset, test_idx)
 
-    # ------------- 4) 数据验证 -------------
+    # ------------- 4) Quick data check -------------
     sample_mri, sample_pet, sample_label = train_dataset[0]
     print(f"Sample MRI shape: {sample_mri.shape}, Label: {sample_label}")
 
-    # 如仍需查看部分样本，可在 Subset 上迭代索引：
     def preview(ds, name, k=5):
-        print(f"\n{name} preview (前 {k} 条):")
+        print(f"\n{name} preview (first {k} samples):")
         for i in range(k):
             subj = full_dataset.data_dict[ds.indices[i]]['Subject']
             lbl  = full_dataset.data_dict[ds.indices[i]]['label']
@@ -156,7 +164,7 @@ def main():
     preview(train_dataset, "Train", 20)
     preview(test_dataset,  "Test",  5)
 
-    # ------------- 5) 预处理流程 -------------
+    # ------------- 5) Transform pipeline -------------
     train_transform, _ = ADNI_transform(augment=False)
     print("\nTransforms pipeline:")
     for i, t in enumerate(train_transform.transforms):
