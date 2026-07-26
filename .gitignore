@@ -1,2 +1,6 @@
 *.pth
 *.nii
+__pycache__/
+*.pyc
+checkpoints*/
+*.joblib

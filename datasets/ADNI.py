@@ -1,177 +1,286 @@
-"""
-Purpose: ADNI dataset loader and preprocessing utilities.
-This module:
-- Loads labels from ADNI CSV and maps groups to task-specific class ids
-- Builds a data dictionary with MRI/PET NIfTI paths and subject ids
-- Provides MONAI transforms to normalize intensity and pad both MRI/PET
-  to a unified size of (96, 112, 96), with optional augmentation
-- Offers simple dataset info printing helpers
-"""
+"""ADNI MRI/PET loader and transforms (train: z-score+noise; val/test: z-score)."""
+
+from __future__ import annotations
+
 import os
-import pandas as pd
-from torch.utils.data import Dataset,DataLoader, Subset
 from collections import Counter
-import torch
-from sklearn.model_selection import train_test_split
-from sklearn.model_selection import StratifiedKFold
+from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+import pandas as pd
 from monai.transforms import (
-    LoadImaged, EnsureChannelFirstd, ScaleIntensityd, EnsureTyped,
-    RandFlipd, RandRotated, RandZoomd, SpatialPadd, Compose
+    Compose,
+    EnsureChannelFirstd,
+    EnsureTyped,
+    LoadImaged,
+    NormalizeIntensityd,
+    RandFlipd,
+    RandGaussianNoised,
+    RandRotated,
+    RandZoomd,
+    SpatialPadd,
 )
+from torch.utils.data import Dataset
 
-# Dataset class definition
-class ADNI(Dataset):
-    def __init__(self, label_file, mri_dir, pet_dir,task='ADCN', augment=False):
-        # self.label = pd.read_csv(label_file)
-        self.label = pd.read_csv(label_file, encoding='ISO-8859-1')
-        self.mri_dir = mri_dir
-        self.pet_dir = pet_dir
-        self.task = task
-        self.augment = augment
+from .tabular import normalize_group_for_task, resolve_task_labels
 
-        self._process_labels()
-        self._build_data_dict()
-        self._print_class_counts()
+PAD_SIZE = (96, 112, 96)
+IMAGE_KEYS = ("MRI", "PET")
 
-    def _process_labels(self):
-        """Extract labels from the CSV according to the specified task."""
-        if self.task == 'ADCN':
-            self.labels = self.label[(self.label['Group'] == 'AD') | (self.label['Group'] == 'CN')]
-            self.label_dict = {'CN': 0, 'AD': 1}
-        if self.task == 'SMCIPMCI':
-            self.labels = self.label[(self.label['Group'] == 'SMCI') | (self.label['Group'] == 'PMCI')]
-            self.label_dict = {'SMCI': 0, 'PMCI': 1}
 
-    def _build_data_dict(self):
-        subject_list = self.labels['Subject_ID'].tolist()
-        label_list = self.labels['Group'].tolist()
-        self.data_dict = [
-            {
-                'MRI': os.path.join(self.mri_dir, f'{subject}.nii'),
-                'PET': os.path.join(self.pet_dir, f'{subject}.nii'),
-                'label': self.label_dict[group],
-                'Subject': subject
-            } for subject, group in zip(subject_list, label_list)
-        ]
-
-    def _print_class_counts(self):
-        """Print sample counts per label in the current data_dict."""
-        inv = {v: k for k, v in self.label_dict.items()}
-        cnt = Counter(sample['label'] for sample in self.data_dict)
-        print(f"\n[ADNI Dataset: {self.task}] Sample distribution:")
-        for lbl_value, num in cnt.items():
-            print(f"  {inv[lbl_value]} ({lbl_value}): {num}")
-        print()
-
-    def __len__(self):
-        return len(self.data_dict)
-
-    def __getitem__(self, idx):
-        """Return MRI, PET and label tensors for a given index."""
-        sample = self.data_dict[idx]
-        label = sample['label']
-
-        # Load MRI/PET images
-        mri_img = LoadImaged(keys=['MRI'])({'MRI': sample['MRI']})['MRI']
-        pet_img = LoadImaged(keys=['PET'])({'PET': sample['PET']})['PET']
-        return mri_img, pet_img, label
-
-    def print_dataset_info(self, start=0, end=None):
-        print(f"\nDataset Structure:\n{'=' * 40}")
-        print(f"Total Samples: {len(self)}")
-        print(f"Task: {self.task}")
-
-        pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', None)
-        pd.set_option('display.max_colwidth', None)
-
-        end = end or len(self)
-        df = pd.DataFrame(
-            [
-                [s['MRI'], s['label'], s['Subject']]
-                for s in self.data_dict[start:end]
-            ],
-            columns=["MRI", "Label", "Subject"]
-        )
-        print(df)
-        print(f"{'=' * 40}\n")
-
-# Preprocessing: MRI & PET unified padding, normalization, optional augmentation
-def ADNI_transform(augment=False):
-    keys = ['MRI','PET']  # unified keys for both modalities
-    pad_size = (96, 112, 96)  # target size
-
-    base_transforms = [
-        LoadImaged(keys=keys),
-        EnsureChannelFirstd(keys=keys),
-        ScaleIntensityd(keys=keys),
-        SpatialPadd(keys=keys, spatial_size=pad_size, method="end", mode="constant"),
-        EnsureTyped(keys=keys),
+def build_mri_pet_transforms(
+    *,
+    augment: bool = False,
+    pad_size: Sequence[int] = PAD_SIZE,
+    noise_std: float = 0.1,
+    noise_prob: float = 0.5,
+    keys: Sequence[str] = IMAGE_KEYS,
+) -> Tuple[Compose, Compose]:
+    key_list = list(keys)
+    if not key_list:
+        return Compose([]), Compose([])
+    common = [
+        LoadImaged(keys=key_list),
+        EnsureChannelFirstd(keys=key_list),
+        NormalizeIntensityd(keys=key_list, nonzero=True, channel_wise=True),
+        SpatialPadd(keys=key_list, spatial_size=tuple(pad_size), method="end", mode="constant"),
+        EnsureTyped(keys=key_list),
     ]
-
+    train_list = list(common)
     if augment:
-        base_transforms.insert(3, RandFlipd(keys=keys, prob=0.3, spatial_axis=0))
-        base_transforms.insert(4, RandRotated(keys=keys, prob=0.3, range_x=0.05))
-        base_transforms.insert(5, RandZoomd(keys=keys, prob=0.3, min_zoom=0.95, max_zoom=1))
+        spatial = [
+            RandFlipd(keys=key_list, prob=0.3, spatial_axis=0),
+            RandRotated(keys=key_list, prob=0.3, range_x=0.05),
+            RandZoomd(keys=key_list, prob=0.3, min_zoom=0.95, max_zoom=1.0),
+        ]
+        train_list = common[:3] + spatial + common[3:]
+    train_list = (
+        train_list[:-1]
+        + [RandGaussianNoised(keys=key_list, prob=noise_prob, mean=0.0, std=noise_std)]
+        + train_list[-1:]
+    )
+    return Compose(train_list), Compose(common)
 
-    train_transform = Compose(base_transforms)
-    test_transform  = Compose(base_transforms[:5])  # no augmentation; normalization + padding only
 
-    return train_transform, test_transform
-
-
-def main():
-    # ------------- Basic paths and task -------------
-    label_filename  = rf'adni_dataset\ADNI_902.csv'
-    mri_dir         = rf'adni_dataset\MRI'
-    pet_dir         = rf'adni_dataset\PET'
-    task            = 'SMCIPMCI'        # two-class subset (AD vs CN / SMCI vs PMCI)
-
-    # ------------- 1) Build the full dataset once -------------
-    full_dataset = ADNI(
-        label_file=label_filename,
-        mri_dir=mri_dir,
-        pet_dir=pet_dir,
-        task=task
-    )   # prints sample distribution automatically
-
-    # ------------- 2) Stratified index split -------------
-    indices = list(range(len(full_dataset)))
-    labels  = [full_dataset.data_dict[i]['label'] for i in indices]
-
-    train_idx, test_idx = train_test_split(
-        indices,
-        test_size=0.2,
-        random_state=42,
-        stratify=labels           # keep label ratio consistent
+def ADNI_transform(
+    augment: bool = False,
+    noise_std: float = 0.1,
+    noise_prob: float = 0.5,
+    pad_size: Sequence[int] = PAD_SIZE,
+    keys: Sequence[str] = IMAGE_KEYS,
+) -> Tuple[Compose, Compose]:
+    return build_mri_pet_transforms(
+        augment=augment,
+        pad_size=pad_size,
+        noise_std=noise_std,
+        noise_prob=noise_prob,
+        keys=keys,
     )
 
-    # ------------- 3) Build subsets -------------
-    train_dataset = Subset(full_dataset, train_idx)
-    test_dataset  = Subset(full_dataset, test_idx)
 
-    # ------------- 4) Quick data check -------------
-    sample_mri, sample_pet, sample_label = train_dataset[0]
-    print(f"Sample MRI shape: {sample_mri.shape}, Label: {sample_label}")
-
-    def preview(ds, name, k=5):
-        print(f"\n{name} preview (first {k} samples):")
-        for i in range(k):
-            subj = full_dataset.data_dict[ds.indices[i]]['Subject']
-            lbl  = full_dataset.data_dict[ds.indices[i]]['label']
-            print(f"  idx={ds.indices[i]:>4}  Subject={subj}  Label={lbl}")
-    preview(train_dataset, "Train", 20)
-    preview(test_dataset,  "Test",  5)
-
-    # ------------- 5) Transform pipeline -------------
-    train_transform, _ = ADNI_transform(augment=False)
-    print("\nTransforms pipeline:")
-    for i, t in enumerate(train_transform.transforms):
-        print(f"  {i+1:>2}. {t.__class__.__name__}")
+def _resolve_nifti_path(directory: str, subject_id: str) -> str:
+    path = os.path.join(directory, f"{subject_id}.nii")
+    if os.path.isfile(path):
+        return path
+    gz = path + ".gz"
+    return gz if os.path.isfile(gz) else path
 
 
-if __name__ == '__main__':
-    main()
-    # run_5fold_cv()
-    
+def build_image_data_dict(
+    label_df: pd.DataFrame,
+    mri_dir: str,
+    pet_dir: str,
+    task: str,
+    *,
+    subject_col: str = "Subject_ID",
+    label_col: str = "Group",
+    check_files: bool = True,
+    allow_missing: bool = False,
+    dataset_name: str = "Dataset",
+) -> List[dict]:
+    label_dict = resolve_task_labels(task)
+    if subject_col not in label_df.columns:
+        raise KeyError(f"[{dataset_name}] Missing column '{subject_col}'")
+    if label_col not in label_df.columns:
+        raise KeyError(f"[{dataset_name}] Missing column '{label_col}'")
+
+    groups = label_df[label_col].map(lambda g: normalize_group_for_task(g, task))
+    mask = groups.isin(label_dict.keys())
+    filtered = label_df.loc[mask].copy()
+    filtered["_group_norm"] = groups.loc[mask]
+    if filtered.empty:
+        raise ValueError(f"[{dataset_name}] No samples for task '{task}'")
+
+    dups = filtered[subject_col][filtered[subject_col].duplicated()].tolist()
+    if dups:
+        raise ValueError(f"[{dataset_name}] Duplicate Subject_ID: {dups[:10]}")
+
+    samples: List[dict] = []
+    missing_mri: List[str] = []
+    missing_pet: List[str] = []
+    for _, row in filtered.iterrows():
+        sid = str(row[subject_col])
+        mri_path = _resolve_nifti_path(mri_dir, sid)
+        pet_path = _resolve_nifti_path(pet_dir, sid)
+        if check_files:
+            has_mri, has_pet = os.path.isfile(mri_path), os.path.isfile(pet_path)
+            if not has_mri:
+                missing_mri.append(sid)
+            if not has_pet:
+                missing_pet.append(sid)
+            if not has_mri or not has_pet:
+                continue
+        samples.append(
+            {
+                "MRI": mri_path,
+                "PET": pet_path,
+                "label": int(label_dict[row["_group_norm"]]),
+                "Subject": sid,
+            }
+        )
+
+    if check_files and (missing_mri or missing_pet) and not allow_missing:
+        msgs = []
+        if missing_mri:
+            msgs.append(f"missing MRI ({len(missing_mri)}): {missing_mri[:5]}")
+        if missing_pet:
+            msgs.append(f"missing PET ({len(missing_pet)}): {missing_pet[:5]}")
+        raise FileNotFoundError(f"[{dataset_name}] {'; '.join(msgs)}")
+    if not samples:
+        raise ValueError(f"[{dataset_name}] Empty data_dict")
+    return samples
+
+
+def attach_tabular(
+    data_dict: List[dict],
+    table_map: Dict[str, np.ndarray],
+    *,
+    allow_missing: bool = False,
+    tab_dim: Optional[int] = None,
+) -> List[dict]:
+    missing: List[str] = []
+    out: List[dict] = []
+    inferred_dim = tab_dim
+    for sample in data_dict:
+        sid = sample["Subject"]
+        if sid not in table_map:
+            missing.append(sid)
+            if not allow_missing:
+                continue
+            if inferred_dim is None:
+                raise ValueError("tab_dim required when allow_missing=True")
+            vec = np.zeros((inferred_dim,), dtype=np.float32)
+        else:
+            vec = np.asarray(table_map[sid], dtype=np.float32)
+            inferred_dim = int(vec.shape[0])
+        item = dict(sample)
+        item["tabular"] = vec
+        out.append(item)
+    if missing and not allow_missing:
+        raise KeyError(f"Tabular missing for {len(missing)} subjects: {missing[:5]}")
+    return out
+
+
+class MultiModalDataset(Dataset):
+    """MRI + PET (+ optional tabular) sample dicts."""
+
+    def __init__(
+        self,
+        label_file: str,
+        mri_dir: str,
+        pet_dir: str,
+        task: str = "SMCIPMCI",
+        *,
+        table_map: Optional[Dict[str, np.ndarray]] = None,
+        check_files: bool = True,
+        allow_missing: bool = False,
+        augment: bool = False,
+        dataset_name: str = "MultiModal",
+        encoding: str = "ISO-8859-1",
+    ) -> None:
+        import torch
+
+        self._torch = torch
+        self.task = task
+        self.augment = augment
+        self.dataset_name = dataset_name
+        self.label_dict = resolve_task_labels(task)
+        self.label_df = pd.read_csv(label_file, encoding=encoding)
+        self.data_dict = build_image_data_dict(
+            self.label_df,
+            mri_dir,
+            pet_dir,
+            task,
+            check_files=check_files,
+            allow_missing=allow_missing,
+            dataset_name=dataset_name,
+        )
+        if table_map is not None:
+            self.data_dict = attach_tabular(
+                self.data_dict, table_map, allow_missing=allow_missing
+            )
+        self._print_class_counts()
+
+    def _print_class_counts(self) -> None:
+        id_to_name = {v: k for k, v in self.label_dict.items()}
+        counts = Counter(s["label"] for s in self.data_dict)
+        print(f"\n[{self.dataset_name}: {self.task}] n={len(self.data_dict)}")
+        for cid, n in sorted(counts.items()):
+            print(f"  {id_to_name.get(cid, cid)} ({cid}): {n}")
+        print()
+
+    def __len__(self) -> int:
+        return len(self.data_dict)
+
+    def __getitem__(self, idx: int) -> dict:
+        sample = dict(self.data_dict[idx])
+        if "tabular" in sample and not self._torch.is_tensor(sample["tabular"]):
+            sample["tabular"] = self._torch.as_tensor(
+                sample["tabular"], dtype=self._torch.float32
+            )
+        return sample
+
+
+class ADNI(Dataset):
+    """ADNI MRI+PET. Exposes ``data_dict`` for MMHF."""
+
+    def __init__(
+        self,
+        label_file: str,
+        mri_dir: str,
+        pet_dir: str,
+        task: str = "ADCN",
+        augment: bool = False,
+        *,
+        check_files: bool = False,
+        allow_missing: bool = False,
+        table_map=None,
+    ) -> None:
+        self._ds = MultiModalDataset(
+            label_file=label_file,
+            mri_dir=mri_dir,
+            pet_dir=pet_dir,
+            task=task,
+            augment=augment,
+            check_files=check_files,
+            allow_missing=allow_missing,
+            table_map=table_map,
+            dataset_name="ADNI",
+        )
+        self.task = task
+        self.augment = augment
+        self.label_df = self._ds.label_df
+        self.label_dict = self._ds.label_dict
+        self.data_dict = self._ds.data_dict
+        allowed = set(resolve_task_labels(task))
+        norm = self.label_df["Group"].map(lambda g: normalize_group_for_task(g, task))
+        self.labels = self.label_df.loc[norm.isin(allowed)].copy()
+
+    def __len__(self) -> int:
+        return len(self._ds)
+
+    def __getitem__(self, idx: int):
+        sample = self.data_dict[idx]
+        mri = LoadImaged(keys=["MRI"])({"MRI": sample["MRI"]})["MRI"]
+        pet = LoadImaged(keys=["PET"])({"PET": sample["PET"]})["PET"]
+        return mri, pet, sample["label"]

@@ -1,27 +1,29 @@
 {
-  "label_file": "E:/adni_dataset/ADNI_902.csv",
-  "mri_dir": "E:/adni_dataset/MRI",
-  "pet_dir": "E:/adni_dataset/PET",
-  "table_dir": "E:/adni_dataset/ADNI_Tabel.csv",
-  "tabular_emb" : "model_tabular/models/tabular_emb.csv",
-  "AAL_dir": "E:/adni_dataset/AAL_space-MNI152NLin6_res-2x2x2.nii/AAL_space-MNI152NLin6_res-2x2x2.nii",
-  "table_startcol": 3,
+  "label_file": "adni_dataset/ADNI_902.csv",
+  "mri_dir": "adni_dataset/MRI",
+  "pet_dir": "adni_dataset/PET",
+  "table_dir": "adni_dataset/ADNI_Tabel.csv",
+  "AAL_dir": "adni_dataset/AAL_space-MNI152NLin6_res-2x2x2.nii/AAL_space-MNI152NLin6_res-2x2x2.nii",
+
   "task": "SMCIPMCI",
-  "augment": false,
-  "split_ratio_test": 0.2,
-  "seed": 42,
-  "device":"cuda:0",
+  "feature_schema": "full133",
+
+  "device": "cuda:0",
   "num_epochs": 100,
-  "batch_size": 4,
+  "batch_size": 1,
   "lr": 1e-6,
-  "weight_decay": 1e-5,
-  "fp16":true,
+  "weight_decay": 1e-4,
+  "fp16": true,
+
+  "n_splits": 5,
+  "split_ratio_test": 0.2,
+  "split_ratio_val": 0.2,
+  "seed": 42,
+
   "checkpoint_dir": "checkpoints",
-  "nb_class": 2,
-  "n_splits":5,
-  "dropout_rate":0.5,
-  "in_channels": 2,
-  "seg_task":false,
-  "img_dim": 512,
-  "tab_dim": 192
+  "show_batch_progress": true,
+
+  "use_mri": true,
+  "use_pet": true,
+  "use_table": true
 }

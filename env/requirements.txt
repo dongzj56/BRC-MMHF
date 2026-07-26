@@ -1,12 +1,43 @@
+# BRC-MMHF Python dependencies
+# Tested with: Python 3.10, CUDA 12.4 (conda env: mmhf)
+#
+# Install (GPU, recommended; match your CUDA):
+#   pip install -r env/requirements.txt
+#   # or install PyTorch first from https://pytorch.org then the rest:
+#   pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r env/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
+#
+# CPU-only:
+#   pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r env/requirements.txt
+
+# ---- Core (main training: MMHF.py / experiments/run_ablation.py) ----
 torch==2.4.1
-tqdm==4.67.1
-monai==1.4.0
+torchvision==0.19.1
+numpy==1.26.4
+scipy==1.15.3
 pandas==2.2.3
 scikit-learn==1.6.1
-numpy==1.26.4
-matplotlib==3.10.3
-tensorboard==2.19.0
+joblib==1.5.3
+monai==1.4.0
 nibabel==5.3.2
+tqdm==4.67.1
+
+# ---- Medical imaging utilities ----
 SimpleITK==2.5.0
 nilearn==0.11.1
+
+# ---- Logging / visualization ----
+matplotlib==3.10.3
+tensorboard==2.19.0
 torchsummary==1.5.1
+
+# ---- Optional extras; uncomment if needed ----
+# einops>=0.7.0
+# torchaudio==2.4.1
+# torch-geometric>=2.5.0
+# tabpfn>=2.0.0
+# jupyter
+# ipykernel
+# seaborn>=0.13.0
+# openpyxl>=3.1.0

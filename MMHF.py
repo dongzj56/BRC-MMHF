@@ -1,50 +1,141 @@
 import os, json, time, csv, numpy as np, pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from monai.data import Dataset as MonaiDataset
-from sklearn.model_selection import StratifiedKFold
+from tqdm import tqdm
 from utils.metrics import calculate_metrics
 from datasets.ADNI import ADNI, ADNI_transform
-from models.mmad_encoder import ImageEncoder_CEN
-from models.cen_unet import CEN_DualUNet3D, TabularEncoder
-from models.ROI_pol import ROIPooling3D
-from models.HGNN import DualModalHyperGraphWithAttn
+from datasets.checks import make_5fold_splits, save_fold_indices
+from datasets.tabular import fit_transform_fold_table, load_tabular_csv
+from models.brc_mmhf import BRCMMHF, build_brc_mmhf_from_cfg
 from utils.losses import compute_class_weights, make_loss
 
-# Configuration load
+
 def load_cfg(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-class Cfg:
-    def __init__(self, d):
-        for k, v in d.items():
-            setattr(self, k, v)
-        self.device = torch.device(self.device if torch.cuda.is_available() and str(self.device).startswith("cuda") else "cpu")
 
-# Data Load
+class Cfg:
+    DEFAULTS = {
+        "task": "SMCIPMCI",
+        "augment": False,
+        "noise_std": 0.1,
+        "noise_prob": 0.5,
+        "split_ratio_test": 0.2,
+        "split_ratio_val": 0.2,
+        "seed": 42,
+        "device": "cuda:0",
+        "num_epochs": 100,
+        "batch_size": 1,
+        "lr": 1e-6,
+        "optimizer": "adam",
+        "weight_decay": 1e-4,
+        "fp16": True,
+        "checkpoint_dir": "checkpoints_mmad_mci",
+        "nb_class": 2,
+        "n_splits": 5,
+        "feature_schema": "full133",
+        "show_batch_progress": True,
+        "use_mri": True,
+        "use_pet": True,
+        "use_table": True,
+        "use_shared_layer": True,
+        "use_channel_exchange": True,
+        "use_hypergraph_conv": True,
+        "use_hypergraph_attention": True,
+        "use_seg_task": False,
+        "seg_task": False,
+        "seg_alpha": 0.05,
+        "roi_start": 1,
+        "roi_end": 90,
+        "hg_ks": [6, 18],
+        "exchange_ratio": 0.2,
+        "level_channels": [64, 128, 256],
+        "bottleneck_channel": 512,
+        "image_feature_dim": 128,
+        "tab_feature_dim": 64,
+        "dropout_rate": 0.5,
+    }
+
+    def __init__(self, d):
+        values = dict(self.DEFAULTS)
+        values.update(d)
+        for k, v in values.items():
+            setattr(self, k, v)
+        self.device = resolve_device(getattr(self, "device", "cuda:0"))
+
+
+def resolve_device(device_spec="cuda:0"):
+    """Prefer cuda:0 for training; fall back to CPU only if CUDA is unavailable."""
+    spec = str(device_spec).strip() if device_spec is not None else "cuda:0"
+    if not torch.cuda.is_available():
+        print("[Device] CUDA unavailable -> using cpu")
+        return torch.device("cpu")
+    if not spec.startswith("cuda"):
+        # Force training onto GPU 0 unless user explicitly needs CPU for debugging
+        print(f"[Device] overriding '{spec}' -> cuda:0")
+        spec = "cuda:0"
+    # Normalize bare "cuda" to cuda:0
+    if spec == "cuda":
+        spec = "cuda:0"
+    idx = int(spec.split(":")[1]) if ":" in spec else 0
+    if idx < 0 or idx >= torch.cuda.device_count():
+        print(f"[Device] invalid {spec}, falling back to cuda:0")
+        idx = 0
+        spec = "cuda:0"
+    torch.cuda.set_device(idx)
+    print(f"[Device] using {spec} ({torch.cuda.get_device_name(idx)})")
+    return torch.device(spec)
+
+
+def _fold_meta(cfg, n_samples):
+    return {
+        "seed": int(getattr(cfg, "seed", 42)),
+        "n_splits": int(getattr(cfg, "n_splits", 5)),
+        "test_size": float(getattr(cfg, "split_ratio_test", 0.2)),
+        "val_size": float(getattr(cfg, "split_ratio_val", 0.2)),
+        "n_samples": int(n_samples),
+        "task": str(getattr(cfg, "task", "")),
+    }
+
+
 def build_fold_indices(cfg, data_dict):
     labels = [d["label"] for d in data_dict]
-    skf = StratifiedKFold(n_splits=cfg.n_splits, shuffle=True, random_state=cfg.seed)
-    result = {}
-    for fold_idx, (train_val_idx, test_idx) in enumerate(skf.split(np.arange(len(data_dict)), labels), start=1):
-        train_val_labels = [labels[i] for i in train_val_idx]
-        n_train = int(len(train_val_idx) * 0.9)
-        train_idx = train_val_idx[:n_train].tolist()
-        val_idx = train_val_idx[n_train:].tolist()
-        result[str(fold_idx)] = {
-            "train_idx": train_idx,
-            "val_idx": val_idx,
-            "test_idx": test_idx.tolist(),
-        }
+    result = make_5fold_splits(
+        labels,
+        n_splits=int(getattr(cfg, "n_splits", 5)),
+        seed=int(getattr(cfg, "seed", 42)),
+        test_size=float(getattr(cfg, "split_ratio_test", 0.2)),
+        val_size=float(getattr(cfg, "split_ratio_val", 0.2)),
+    )
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     json_path = os.path.join(cfg.checkpoint_dir, "fold_indices.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
+    save_fold_indices(result, json_path)
+    meta_path = os.path.join(cfg.checkpoint_dir, "fold_indices.meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(_fold_meta(cfg, len(data_dict)), f, indent=2)
     return result
+
+
+def ensure_fold_indices(cfg, data_dict):
+    """Rebuild fold_indices.json when missing or config meta mismatches."""
+    json_path = os.path.join(cfg.checkpoint_dir, "fold_indices.json")
+    meta_path = os.path.join(cfg.checkpoint_dir, "fold_indices.meta.json")
+    expected = _fold_meta(cfg, len(data_dict))
+    if os.path.exists(json_path) and os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            old = json.load(f)
+        if old == expected:
+            return json_path
+        print(f"[Split] fold_indices meta mismatch ({old} != {expected}); rebuilding")
+    elif os.path.exists(json_path) and not os.path.exists(meta_path):
+        print("[Split] fold_indices.meta.json missing; rebuilding for current config")
+    build_fold_indices(cfg, data_dict)
+    return json_path
+
 
 def load_fold_indices(json_path, fold):
     with open(json_path, "r", encoding="utf-8") as f:
@@ -52,179 +143,175 @@ def load_fold_indices(json_path, fold):
     d = all_indices[str(fold)]
     return d["train_idx"], d["val_idx"], d["test_idx"]
 
-# DataLoader Build
+
 def get_dataloaders(cfg, full_ds, fold):
-    train_idx, val_idx, test_idx = load_fold_indices(os.path.join(cfg.checkpoint_dir, "fold_indices.json"), fold)
-    tf_tr, tf_val = ADNI_transform(augment=cfg.augment)
-    tf_te = tf_val
+    train_idx, val_idx, test_idx = load_fold_indices(
+        os.path.join(cfg.checkpoint_dir, "fold_indices.json"), fold
+    )
+    image_keys = []
+    if bool(getattr(cfg, "use_mri", True)):
+        image_keys.append("MRI")
+    if bool(getattr(cfg, "use_pet", True)):
+        image_keys.append("PET")
+    tf_tr, tf_val = ADNI_transform(
+        augment=bool(getattr(cfg, "augment", False)),
+        noise_std=float(getattr(cfg, "noise_std", 0.1)),
+        noise_prob=float(getattr(cfg, "noise_prob", 0.5)),
+        keys=image_keys,
+    )
     ds_train = MonaiDataset([full_ds[i] for i in train_idx], transform=tf_tr)
     ds_val = MonaiDataset([full_ds[i] for i in val_idx], transform=tf_val)
-    ds_test = MonaiDataset([full_ds[i] for i in test_idx], transform=tf_te)
+    ds_test = MonaiDataset([full_ds[i] for i in test_idx], transform=tf_val)
     loader_tr = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True, num_workers=0, pin_memory=True)
     loader_val = DataLoader(ds_val, batch_size=cfg.batch_size, shuffle=False, num_workers=0, pin_memory=True)
     loader_te = DataLoader(ds_test, batch_size=cfg.batch_size, shuffle=False, num_workers=0, pin_memory=True)
     return loader_tr, loader_val, loader_te
 
-# Table embedding loading and mapping
+
 def load_table_embeddings(csv_path):
     df = pd.read_csv(csv_path)
     cols = [c for c in df.columns if c not in ("Subject_ID", "label")]
     dim = len(cols)
-    mapping = {row["Subject_ID"]: row[cols].astype(np.float32).values for _, row in df.iterrows()}
+    mapping = {
+        str(row["Subject_ID"]): row[cols].astype(np.float32).values
+        for _, row in df.iterrows()
+    }
     return mapping, dim
 
-def get_table_tensor(subject_ids, table_map, tab_dim, device):
+
+def resolve_table_map(cfg, full_ds, train_idx, fold):
+    """Prefer tabular_emb.csv if present; else fold-wise TabularPreprocessor on table_dir."""
+    emb_path = getattr(cfg, "tabular_emb", None)
+    if emb_path not in (None, "", "null") and os.path.isfile(str(emb_path)):
+        print(f"[Tabular] using precomputed embeddings: {emb_path}")
+        return load_table_embeddings(str(emb_path))
+
+    table_path = getattr(cfg, "table_dir", None) or getattr(cfg, "table_file", None)
+    if not table_path or not os.path.isfile(table_path):
+        raise FileNotFoundError(
+            "No tabular features found. Provide an existing tabular_emb CSV "
+            "or table_dir / table_file with baseline clinical variables."
+        )
+    table_df = load_tabular_csv(table_path)
+    train_sids = [str(full_ds[i]["Subject"]) for i in train_idx]
+    all_sids = [str(d["Subject"]) for d in full_ds]
+    save_path = os.path.join(cfg.checkpoint_dir, f"tabular_preproc_fold{fold}.joblib")
+    mapping, dim, _ = fit_transform_fold_table(
+        table_df,
+        train_sids,
+        all_sids,
+        task=cfg.task,
+        feature_schema=getattr(cfg, "feature_schema", "full133"),
+        scale_numeric=True,
+        save_path=save_path,
+    )
+    print(
+        f"[Tabular] fold {fold}: fit on train only -> dim={dim}, "
+        f"schema={getattr(cfg, 'feature_schema', 'full133')}"
+    )
+    return mapping, dim
+
+
+def get_table_tensor(subject_ids, table_map, tab_dim, device, batch=None):
+    if batch is not None and "tabular" in batch:
+        return batch["tabular"].to(device).float()
     vecs = []
     for sid in subject_ids:
-        v = table_map.get(sid)
+        v = table_map.get(str(sid))
         if v is None:
             v = np.zeros((tab_dim,), dtype=np.float32)
         vecs.append(v)
     arr = np.stack(vecs, axis=0)
     return torch.from_numpy(arr).to(device)
 
-# Model creation: Image encoder and multimodal classifier
-class HyperGraphImageModel(nn.Module):
-    def __init__(self, cfg_local):
-        super().__init__()
-        # Use CEN-enabled Dual Stream U-Net
-        # Assuming level_channels=[64, 128, 256], l1=64 matches HGNN in_dim
-        # num_classes=2 enables segmentation head for auxiliary loss (Background vs Brain/ROI)
-        self.unet = CEN_DualUNet3D(
-            in_channels=1,
-            num_classes=2, 
-            level_channels=[64, 128, 256],
-            bottleneck_channel=512,
-            share_layers=2,
-            cen_ratios=(0.2, 0.1)
-        ).to(cfg_local.device)
-        
-        self.pool = ROIPooling3D(cfg_local.AAL_dir).to(cfg_local.device)
-        ks = getattr(cfg_local, "hg_ks", {0: (6, 18), 1: (6, 18)})
-        
-        # HGNN takes ROI features (dim=64)
-        self.hg = DualModalHyperGraphWithAttn(
-            in_dim=64, 
-            hidden_dim=128, 
-            num_layers=2, 
-            ks=ks,
-            dk=64
-        ).to(cfg_local.device)
 
-    def forward(self, mri, pet):
-        # Extract feature maps with CEN interaction
-        # Returns features and segmentation logits
-        fm, fp, seg_m, seg_p = self.unet(mri, pet)
-        
-        # ROI Pooling to get node features
-        rm = self.pool(fm)   # [B, R, 64]
-        rp = self.pool(fp)
-        
-        # Hypergraph Fusion (Dynamic & Lesion Aware via Attention)
-        out = self.hg(rm, rp)
-        
-        # Global aggregation
-        v = torch.cat([out["global_mod1"], out["global_mod2"]], dim=1)  # [B, 128]
-        
-        # Return global vector and segmentation logits for aux loss
-        return v, seg_m, seg_p
+def build_model(cfg, tab_dim: int) -> BRCMMHF:
+    model = build_brc_mmhf_from_cfg(cfg, tab_dim=tab_dim)
+    return model.to(cfg.device)
 
-def generate_image_model(cfg):
-    model_type = getattr(cfg, "model_type", "cen")
-    if model_type == "hypergraph":
-        return HyperGraphImageModel(cfg)
-    else:
-        model = ImageEncoder_CEN(
-            in_ch_modality=1,
-            level_channels=[64, 128, 256],
-            bottleneck_ch=512,
-            share_layers=0,
-            cen_ratios=(0.20,),
-            share_scheme="bottleneck",
-        ).to(cfg.device)
-        return model
 
-class MultiModalClassifier(nn.Module):
-    """
-    Classifier with Tabular Encoder (MLP)
-    """
-    def __init__(self, img_dim, tab_dim, num_classes):
-        super().__init__()
-        self.img_dim = img_dim
-        self.tab_dim = tab_dim
-        
-        # Lightweight Tabular Encoder
-        self.tab_encoder = TabularEncoder(input_dim=tab_dim, output_dim=64)
-        
-        self.fc = nn.Sequential(
-            nn.Linear(img_dim + 64, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_classes)
-        )
+def build_optimizer(cfg, model):
+    name = str(getattr(cfg, "optimizer", "adam")).lower()
+    if name != "adam":
+        raise ValueError(f"Unsupported optimizer '{name}'. The paper setting is 'adam'.")
+    return torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    def forward(self, img_feat, table_feat):
-        # Encode tabular data
-        tab_emb = self.tab_encoder(table_feat)
-        # Concatenate
-        x = torch.cat([img_feat, tab_emb], dim=1)
-        return self.fc(x)
 
-def generate_mm_classifier(cfg, img_dim, tab_dim):
-    model = MultiModalClassifier(
-        img_dim=img_dim,
-        tab_dim=tab_dim,
-        num_classes=cfg.nb_class,
-    ).to(cfg.device)
-    return model
+def _batch_modalities(batch, cfg, table_map, tab_dim, device):
+    use_mri = bool(getattr(cfg, "use_mri", True))
+    use_pet = bool(getattr(cfg, "use_pet", True))
+    use_table = bool(getattr(cfg, "use_table", True))
 
-# Single-fold training/validation
-def epoch_run(loader, img_encoder, clf_model, optimizer, scaler, criterion, device, table_map, tab_dim, fp16):
+    mri = batch["MRI"].to(device) if use_mri else None
+    pet = batch["PET"].to(device) if use_pet else None
+    label = batch["label"].to(device).long()
+    subjects = batch.get("Subject", [""] * label.size(0))
+    table = None
+    if use_table:
+        table = get_table_tensor(subjects, table_map, tab_dim, device, batch=batch).float()
+    return mri, pet, table, label, subjects
+
+
+def epoch_run(loader, model, optimizer, scaler, criterion, device, table_map, tab_dim, fp16, cfg, desc=None):
     is_train = optimizer is not None
-    if is_train:
-        clf_model.train()
-        img_encoder.train()
-    else:
-        clf_model.eval()
-        img_encoder.eval()
+    model.train(is_train)
     loss_sum = 0.0
     y_true_all, y_pred_all, y_prob_all = [], [], []
-    
-    # Auxiliary Loss (Segmentation) - Placeholder since dataset lacks masks
-    # If masks were available, we would use DiceLoss or CrossEntropy
-    seg_criterion = nn.CrossEntropyLoss() 
-    
-    for batch in loader:
-        mri = batch["MRI"].to(device)
-        pet = batch["PET"].to(device)
-        label = batch["label"].to(device).long()
-        subjects = batch.get("Subject", [""] * mri.size(0))
-        table = get_table_tensor(subjects, table_map, tab_dim, device).float()
-        
-        # Check if segmentation mask exists (Placeholder)
-        seg_mask = batch.get("seg_mask") # Currently None from ADNI dataset
-        if seg_mask is not None:
-            seg_mask = seg_mask.to(device).long()
 
-        with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
-                      enabled=bool(fp16 and torch.cuda.is_available())):
-            # Forward pass
-            if isinstance(img_encoder, HyperGraphImageModel):
-                img_feat, seg_m, seg_p = img_encoder(mri, pet)
-            else:
-                img_feat = img_encoder(mri, pet)
-                seg_m, seg_p = None, None
-            
-            logits = clf_model(img_feat, table)
-            cls_loss = criterion(logits, label)
-            
-            # Add auxiliary segmentation loss if masks available
-            loss = cls_loss
-            if seg_mask is not None and seg_m is not None:
-                loss_seg_m = seg_criterion(seg_m, seg_mask)
-                loss_seg_p = seg_criterion(seg_p, seg_mask)
-                loss += 0.1 * (loss_seg_m + loss_seg_p) # Weight 0.1 as per common practice
-                
+    seg_criterion = nn.BCEWithLogitsLoss()
+    use_seg = bool(getattr(cfg, "use_seg_task", getattr(cfg, "seg_task", False)))
+    seg_alpha = float(getattr(cfg, "seg_alpha", 0.05))
+    use_mri = bool(getattr(cfg, "use_mri", True))
+    use_pet = bool(getattr(cfg, "use_pet", True))
+    seen_samples = 0
+
+    progress = tqdm(
+        loader,
+        total=len(loader),
+        desc=desc,
+        dynamic_ncols=True,
+        leave=False,
+        disable=not bool(getattr(cfg, "show_batch_progress", True)),
+    )
+    for batch_idx, batch in enumerate(progress, start=1):
+        mri, pet, table, label, _ = _batch_modalities(batch, cfg, table_map, tab_dim, device)
+
+        seg_mask = batch.get("seg_mask")
+        if seg_mask is None and use_seg and use_mri and mri is not None:
+            seg_mask = (mri > 0).float()
+        elif seg_mask is not None:
+            seg_mask = seg_mask.to(device).float()
+            if seg_mask.ndim == 4:
+                seg_mask = seg_mask.unsqueeze(1)
+
+        with torch.set_grad_enabled(is_train):
+            with autocast(
+                device_type="cuda" if torch.cuda.is_available() else "cpu",
+                enabled=bool(fp16 and torch.cuda.is_available()),
+            ):
+                outputs = model(mri=mri, pet=pet, tabular=table)
+                logits = outputs["logits"]
+                cls_loss = criterion(logits, label)
+                loss = cls_loss
+
+                if use_seg and seg_mask is not None:
+                    if seg_mask.ndim == 4:
+                        seg_mask = seg_mask.unsqueeze(1)
+                    seg_terms = []
+                    seg_m = outputs.get("mri_seg")
+                    seg_p = outputs.get("pet_seg")
+                    if use_mri and seg_m is not None:
+                        if seg_m.shape[1] != 1:
+                            seg_m = seg_m[:, 1:2]
+                        seg_terms.append(seg_criterion(seg_m, seg_mask))
+                    if use_pet and seg_p is not None:
+                        if seg_p.shape[1] != 1:
+                            seg_p = seg_p[:, 1:2]
+                        # PET may not share MRI mask intensity; still use MRI-derived brain mask as proxy
+                        seg_terms.append(seg_criterion(seg_p, seg_mask))
+                    if seg_terms:
+                        loss = cls_loss + seg_alpha * (sum(seg_terms) / len(seg_terms))
+
         if is_train:
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None and bool(fp16):
@@ -234,28 +321,39 @@ def epoch_run(loader, img_encoder, clf_model, optimizer, scaler, criterion, devi
             else:
                 loss.backward()
                 optimizer.step()
+
         probs = torch.softmax(logits, dim=1)[:, 1].float()
         preds = probs > 0.5
         loss_sum += loss.item() * label.size(0)
+        seen_samples += label.size(0)
         y_true_all.extend(label.detach().cpu().numpy().tolist())
         y_pred_all.extend(preds.detach().cpu().numpy().astype(int).tolist())
         y_prob_all.extend(probs.detach().cpu().numpy().tolist())
+        running_loss = loss_sum / max(seen_samples, 1)
+        progress.set_postfix(loss=f"{running_loss:.4f}")
+
     epoch_loss = loss_sum / len(loader.dataset)
     metrics = calculate_metrics(y_true_all, y_pred_all, y_prob_all)
     return epoch_loss, metrics
 
-# Single-fold training: Record metrics and save the best checkpoint
+
+def _fmt_metric(value):
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "nan"
+    return f"{float(value):.4f}"
+
+
+def _fmt_epoch_metrics(split_name, loss, metrics):
+    keys = ["ACC", "PRE", "SEN", "SPE", "BACC", "F1", "AUC", "MCC"]
+    values = " ".join(f"{k}={_fmt_metric(metrics[k])}" for k in keys)
+    return f"{split_name:<5} Loss={loss:.6f} {values}"
+
+
 def train_fold(cfg, fold, loaders, table_map, tab_dim):
     device = cfg.device
-    img_encoder = generate_image_model(cfg)
-    model_type = getattr(cfg, "model_type", "cen")
-    img_dim = 128 if model_type == "hypergraph" else 1024
-    clf_model = generate_mm_classifier(cfg, img_dim=img_dim, tab_dim=tab_dim)
-    
-    # Train both Image Encoder and Classifier (End-to-End)
-    params = list(img_encoder.parameters()) + list(clf_model.parameters())
-    optimizer = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
-    
+    model = build_model(cfg, tab_dim=tab_dim)
+    optimizer = build_optimizer(cfg, model)
+
     train_labels = [d["label"] for d in loaders[0].dataset.data]
     nb_class = int(getattr(cfg, "nb_class", 2))
     class_weights = compute_class_weights(train_labels, num_classes=nb_class).to(device)
@@ -267,49 +365,59 @@ def train_fold(cfg, fold, loaders, table_map, tab_dim):
     csv_path = os.path.join(cfg.checkpoint_dir, f"fold{fold}_metrics.csv")
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["epoch", "set", "Loss", "ACC", "SEN", "SPE", "F1", "AUC", "MCC"])
+        w.writerow(["epoch", "set", "Loss", "ACC", "PRE", "SEN", "SPE", "BACC", "F1", "AUC", "MCC"])
+
     for epoch in range(1, cfg.num_epochs + 1):
         t0 = time.time()
-        tr_loss, tr_metrics = epoch_run(loaders[0], img_encoder, clf_model, optimizer, scaler, criterion, device, table_map, tab_dim, cfg.fp16)
-        vl_loss, vl_metrics = epoch_run(loaders[1], img_encoder, clf_model, None, None, criterion, device, table_map, tab_dim, cfg.fp16)
+        tr_loss, tr_metrics = epoch_run(
+            loaders[0], model, optimizer, scaler, criterion, device, table_map, tab_dim, cfg.fp16, cfg,
+            desc=f"Fold {fold} Epoch {epoch:03d} train",
+        )
+        vl_loss, vl_metrics = epoch_run(
+            loaders[1], model, None, None, criterion, device, table_map, tab_dim, cfg.fp16, cfg,
+            desc=f"Fold {fold} Epoch {epoch:03d} val",
+        )
         with open(csv_path, "a", newline="") as f:
             w = csv.writer(f)
-            w.writerow([epoch, "train", f"{tr_loss:.6f}", f"{tr_metrics['ACC']:.4f}", f"{tr_metrics['SEN']:.4f}", f"{tr_metrics['SPE']:.4f}", f"{tr_metrics['F1']:.4f}", f"{tr_metrics['AUC']:.4f}", f"{tr_metrics['MCC']:.4f}"])
-            w.writerow([epoch, "val", f"{vl_loss:.6f}", f"{vl_metrics['ACC']:.4f}", f"{vl_metrics['SEN']:.4f}", f"{vl_metrics['SPE']:.4f}", f"{vl_metrics['F1']:.4f}", f"{vl_metrics['AUC']:.4f}", f"{vl_metrics['MCC']:.4f}"])
-        if vl_metrics["AUC"] > best_auc:
-            best_auc = vl_metrics["AUC"]
-            torch.save({"img_encoder": img_encoder.state_dict(), "clf_model": clf_model.state_dict()}, best_path)
+            for split_name, loss, m in (("train", tr_loss, tr_metrics), ("val", vl_loss, vl_metrics)):
+                w.writerow([
+                    epoch, split_name, f"{loss:.6f}",
+                    _fmt_metric(m["ACC"]), _fmt_metric(m["PRE"]), _fmt_metric(m["SEN"]),
+                    _fmt_metric(m["SPE"]), _fmt_metric(m["BACC"]), _fmt_metric(m["F1"]),
+                    _fmt_metric(m["AUC"]), _fmt_metric(m["MCC"]),
+                ])
+        score = vl_metrics["BACC"] if np.isnan(vl_metrics["AUC"]) else vl_metrics["AUC"]
+        improved = score > best_auc
+        if score > best_auc:
+            best_auc = score
+            torch.save({"model": model.state_dict(), "tab_dim": tab_dim}, best_path)
         t1 = time.time()
-        print(f"Fold {fold} Epoch {epoch} | train AUC={tr_metrics['AUC']:.4f} val AUC={vl_metrics['AUC']:.4f} | {t1 - t0:.1f}s")
-    return {"img_encoder": img_encoder, "clf_model": clf_model}, best_path, best_auc
+        lr = optimizer.param_groups[0]["lr"]
+        best_mark = " *best*" if improved else ""
+        print(f"\nFold {fold} Epoch {epoch:03d}/{cfg.num_epochs} | {t1 - t0:.1f}s | lr={lr:.2e}{best_mark}", flush=True)
+        print(_fmt_epoch_metrics("train", tr_loss, tr_metrics), flush=True)
+        print(_fmt_epoch_metrics("val", vl_loss, vl_metrics), flush=True)
+    return model, best_path, best_auc
 
-# Single-fold inference: Load the best checkpoint and evaluate
+
 @torch.no_grad()
 def infer_fold(cfg, fold, test_loader, table_map, tab_dim, ckpt_path):
     device = cfg.device
-    img_encoder = generate_image_model(cfg)
-    model_type = getattr(cfg, "model_type", "cen")
-    img_dim = 128 if model_type == "hypergraph" else 1024
-    clf_model = generate_mm_classifier(cfg, img_dim=img_dim, tab_dim=tab_dim)
+    model = build_model(cfg, tab_dim=tab_dim)
     ckpt = torch.load(ckpt_path, map_location=device)
-    img_encoder.load_state_dict(ckpt["img_encoder"])
-    clf_model.load_state_dict(ckpt["clf_model"])
-    img_encoder.to(device).eval()
-    clf_model.to(device).eval()
+    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    model.load_state_dict(state)
+    model.to(device).eval()
+
     y_true, y_pred, y_prob = [], [], []
     for batch in test_loader:
-        mri = batch["MRI"].to(device)
-        pet = batch["PET"].to(device)
-        label = batch["label"].to(device).long()
-        subjects = batch.get("Subject", [""] * mri.size(0))
-        table = get_table_tensor(subjects, table_map, tab_dim, device).float()
-        with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
-                      enabled=bool(cfg.fp16 and torch.cuda.is_available())):
-            if isinstance(img_encoder, HyperGraphImageModel):
-                img_feat, _, _ = img_encoder(mri, pet)
-            else:
-                img_feat = img_encoder(mri, pet)
-            logits = clf_model(img_feat, table)
+        mri, pet, table, label, _ = _batch_modalities(batch, cfg, table_map, tab_dim, device)
+        with autocast(
+            device_type="cuda" if torch.cuda.is_available() else "cpu",
+            enabled=bool(cfg.fp16 and torch.cuda.is_available()),
+        ):
+            outputs = model(mri=mri, pet=pet, tabular=table)
+            logits = outputs["logits"]
         probs = torch.softmax(logits, dim=1)[:, 1].float()
         preds = (probs > 0.5).int()
         y_true.extend(label.cpu().numpy().tolist())
@@ -318,7 +426,77 @@ def infer_fold(cfg, fold, test_loader, table_map, tab_dim, ckpt_path):
     metrics = calculate_metrics(y_true, y_pred, y_prob)
     return metrics, y_true, y_pred, y_prob
 
-# Main workflow: Config loading → Splitting → Training → Testing → Summarizing  
+
+def run_training(cfg, folds=None):
+    """Reusable entry used by MMHF __main__ and experiments/run_ablation.py."""
+    full_dataset = ADNI(cfg.label_file, cfg.mri_dir, cfg.pet_dir, cfg.task, cfg.augment)
+    full_ds = full_dataset.data_dict
+    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    ensure_fold_indices(cfg, full_ds)
+    indices_path = os.path.join(cfg.checkpoint_dir, "fold_indices.json")
+    results_txt = os.path.join(cfg.checkpoint_dir, "test_results.txt")
+    result_csv = os.path.join(cfg.checkpoint_dir, "result.csv")
+
+    with open(results_txt, "w", encoding="utf-8") as f:
+        f.write("Fold\tACC\tPRE\tSEN\tSPE\tBACC\tF1\tAUC\tMCC\n")
+    with open(result_csv, "w", newline="", encoding="utf-8") as csv_f:
+        writer = csv.writer(csv_f)
+        writer.writerow([
+            "fold", "idx_in_fold", "sample_id", "true_label", "pred_label", "prob_pmci", "correct"
+        ])
+
+    if folds is None:
+        folds = list(range(1, int(cfg.n_splits) + 1))
+    all_metrics = []
+    for fold in folds:
+        print(f"=== Fold {fold}/{cfg.n_splits} ===")
+        train_idx, _, _ = load_fold_indices(indices_path, fold)
+        table_map, tab_dim = resolve_table_map(cfg, full_ds, train_idx, fold)
+        loader_tr, loader_val, loader_te = get_dataloaders(cfg, full_ds, fold)
+        _, best_path, best_auc = train_fold(
+            cfg, fold, (loader_tr, loader_val, loader_te), table_map, tab_dim
+        )
+        metrics, y_true, y_pred, y_prob = infer_fold(
+            cfg, fold, loader_te, table_map, tab_dim, best_path
+        )
+        all_metrics.append(metrics)
+        with open(results_txt, "a", encoding="utf-8") as f:
+            f.write(
+                f"{fold}\t{metrics['ACC']:.4f}\t{metrics['PRE']:.4f}\t{metrics['SEN']:.4f}\t"
+                f"{metrics['SPE']:.4f}\t{metrics['BACC']:.4f}\t{metrics['F1']:.4f}\t"
+                f"{metrics['AUC']:.4f}\t{metrics['MCC']:.4f}\n"
+            )
+        with open(result_csv, "a", newline="", encoding="utf-8") as csv_f:
+            writer = csv.writer(csv_f)
+            test_data = loader_te.dataset.data
+            for idx, sample_dict in enumerate(test_data):
+                sid = sample_dict.get("Subject") or os.path.basename(
+                    sample_dict.get("MRI", f"s{idx}")
+                )
+                writer.writerow([
+                    fold, idx, sid, int(y_true[idx]), int(y_pred[idx]),
+                    float(y_prob[idx]), int(y_true[idx] == y_pred[idx]),
+                ])
+        print(
+            f"Fold {fold} done | best={best_auc:.4f} | "
+            f"test AUC={metrics['AUC']:.4f} BACC={metrics['BACC']:.4f}"
+        )
+
+    print("=== Summary ===")
+    keys = ["ACC", "PRE", "SEN", "SPE", "BACC", "F1", "AUC", "MCC"]
+    summary = {}
+    for k in keys:
+        vals = [m[k] for m in all_metrics if not np.isnan(m[k])]
+        if not vals:
+            print(f"{k}: nan")
+            summary[k] = (float("nan"), float("nan"))
+        else:
+            mean, std = float(np.mean(vals)), float(np.std(vals))
+            print(f"{k}: {mean:.4f} ± {std:.4f}")
+            summary[k] = (mean, std)
+    return all_metrics, summary
+
+
 def main():
     env_cfg = os.environ.get("MMHF_CONFIG")
     candidates = []
@@ -327,6 +505,7 @@ def main():
     candidates += [os.path.join("config", "config2.json"),
                    os.path.join("config", "config.json")]
     chosen = None
+    cfg = None
     for p in candidates:
         if not os.path.exists(p):
             print(f"[Config] Skipping {p}: file not found")
@@ -337,45 +516,16 @@ def main():
             cfg = cfg_try
             print(f"[Config] Using {p}")
             break
-        else:
-            print(f"[Config] Skipping {p}: label_file '{cfg_try.label_file}' not found")
-    if chosen is None:
-        raise FileNotFoundError("Valid configuration file path not found: Please set MMHF_CONFIG to point to a configuration containing an accessible label_file, or correct the data paths in config/config*.json")
-    full_dataset = ADNI(cfg.label_file, cfg.mri_dir, cfg.pet_dir, cfg.task, cfg.augment)
-    full_ds = full_dataset.data_dict
-    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-    indices_path = os.path.join(cfg.checkpoint_dir, "fold_indices.json")
-    if not os.path.exists(indices_path):
-        build_fold_indices(cfg, full_ds)
-    table_map, tab_dim = load_table_embeddings(cfg.tabular_emb)
-    results_txt = os.path.join(cfg.checkpoint_dir, "test_results.txt")
-    result_csv = os.path.join(cfg.checkpoint_dir, "result.csv")
-    with open(results_txt, "w", encoding="utf-8") as f:
-        f.write("Fold\tACC\tPRE\tSEN\tSPE\tF1\tAUC\tMCC\n")
-    with open(result_csv, "w", newline="", encoding="utf-8") as csv_f:
-        writer = csv.writer(csv_f)
-        writer.writerow(["fold", "idx_in_fold", "sample_id", "true_label", "pred_label", "correct"])
-    all_metrics = []
-    for fold in range(1, cfg.n_splits + 1):
-        print(f"=== Fold {fold}/{cfg.n_splits} ===")
-        loader_tr, loader_val, loader_te = get_dataloaders(cfg, full_ds, fold)
-        models, best_path, best_auc = train_fold(cfg, fold, (loader_tr, loader_val, loader_te), table_map, tab_dim)
-        metrics, y_true, y_pred, y_prob = infer_fold(cfg, fold, loader_te, table_map, tab_dim, best_path)
-        all_metrics.append(metrics)
-        with open(results_txt, "a", encoding="utf-8") as f:
-            f.write(f"{fold}\t{metrics['ACC']:.4f}\t{metrics['PRE']:.4f}\t{metrics['SEN']:.4f}\t{metrics['SPE']:.4f}\t{metrics['F1']:.4f}\t{metrics['AUC']:.4f}\t{metrics['MCC']:.4f}\n")
-        with open(result_csv, "a", newline="", encoding="utf-8") as csv_f:
-            writer = csv.writer(csv_f)
-            test_data = loader_te.dataset.data
-            for idx, sample_dict in enumerate(test_data):
-                sid = sample_dict.get("Subject") or os.path.basename(sample_dict.get("MRI", f"s{idx}"))
-                writer.writerow([fold, idx, sid, int(y_true[idx]), int(y_pred[idx]), int(y_true[idx] == y_pred[idx])])
-        print(f"Fold {fold} done | best AUC={best_auc:.4f} | test AUC={metrics['AUC']:.4f}")
-    print("=== Summary ===")
-    keys = ["ACC", "PRE", "SEN", "SPE", "F1", "AUC", "MCC"]
-    for k in keys:
-        vals = [m[k] for m in all_metrics]
-        print(f"{k}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
+        print(f"[Config] Skipping {p}: label_file '{cfg_try.label_file}' not found")
+    if chosen is None or cfg is None:
+        raise FileNotFoundError(
+            "Valid configuration file path not found: Please set MMHF_CONFIG to point to a "
+            "configuration containing an accessible label_file, or correct the data paths in config/config*.json"
+        )
+    # Ensure main training always targets the configured GPU (default cuda:0)
+    cfg.device = resolve_device(getattr(cfg, "device", "cuda:0"))
+    run_training(cfg)
+
 
 if __name__ == "__main__":
     main()

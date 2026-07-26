@@ -1,41 +1,83 @@
 # BRC-MMHF
-**Brain Region-Centered MultiModal Hypergraph Fusion for MCI Conversion Prediction**
 
-## Overview
-BRC-MMHF is a multimodal deep learning framework designed to predict the conversion of Mild Cognitive Impairment (MCI) to Alzheimer's Disease (AD). By integrating MRI and PET imaging data with clinical tabular data, the model leverages a novel Brain Region-Centered hypergraph fusion mechanism to capture complex, high-order correlations between brain regions and modalities.
+Brain Region-Centered Multimodal Hypergraph Fusion for MCI Conversion Prediction.
 
-## Key Features
-- **Multimodal Hypergraph Fusion Framework**: A novel framework for MCI conversion prediction that addresses cross-modal alignment and high-order modeling challenges in MRI-PET fusion.
-- **Dual-Stream 3D U-Net with CEN**: Utilizes a parameter-free channel exchange mechanism and ROI pooling to reduce modality heterogeneity and extract structurally consistent features from MRI and PET images.
-- **Structured Clinical Data Integration**: Integrates clinical data through a lightweight tabular encoder to improve model adaptability and diagnostic robustness.
-- **Interpretability Analysis**: Incorporates a lesion-region identification module to highlight disease-relevant brain regions, enhancing clinical interpretability alongside tabular variable analysis.
+This repository contains a compact PyTorch implementation for the paper workflow:
+ADNI MRI, FDG-PET, and baseline clinical tabular variables for SMCI/PMCI conversion prediction.
 
 ## Requirements
-The project requires Python 3.10+ and the following major dependencies:
-- `torch==2.4.1`
-- `monai==1.4.0`
-- `pandas==2.2.3`
-- `scikit-learn==1.6.1`
-- `numpy==1.26.4`
-- `nibabel==5.3.2`
-- `SimpleITK==2.5.0`
-- `nilearn==0.11.1`
 
-For a full list of dependencies, refer to [requirements.txt](env/requirements.txt).
+Use Python 3.10. The main dependencies are listed in [env/requirements.txt](env/requirements.txt).
+Conda users can start from [env/environment.yml](env/environment.yml).
 
-## Data Preparation
-This framework is designed to work with the ADNI dataset and validates on the SCAN dataset.
+## Data
 
-**Datasets**:
-- **ADNI**: The [Alzheimer's Disease Neuroimaging Initiative](https://ida.loni.usc.edu/) dataset is used for model development. Access applications are available via the LONI Image & Data Archive.
-- **SCAN**: The Standardized Centralized Alzheimer’s Neuroimaging (SCAN) dataset serves as an external validation set. SCAN is a subset of the **National Alzheimer’s Coordinating Center (NACC)**.
+The default config expects processed data under `adni_dataset/`:
 
-**Processing Pipeline**:
-- **Preprocessing**: The preprocessing pipeline for ADNI data is available here: [adni_image_process](https://github.com/dongzj56/adni_image_process.git)
-- **Data Screening**: Tools for data filtering and subject selection: [ADNI_data_filter_code](https://github.com/dongzj56/ADNI_data_filter_code.git)
-- **Reference**: The preprocessing and filtering workflow references the [Clinica tool](https://github.com/aramis-lab/clinica.git).
+- `ADNI_902.csv`
+- `ADNI_Tabel.csv`
+- `MRI/*.nii` or `MRI/*.nii.gz`
+- `PET/*.nii` or `PET/*.nii.gz`
+- `AAL_space-MNI152NLin6_res-2x2x2.nii/...`
 
-## Contact
-Author: Z.J. Dong
+The default task is `SMCIPMCI`, with SMCI as class `0` and PMCI as class `1`.
 
-Email: dongzj56@gmail.com
+## Checks
+
+Check ADNI labels, modality alignment, AAL atlas, tabular preprocessing, fold split, and one MONAI batch:
+
+```bash
+python datasets/test_dataset.py --config config/config2.json --fold 1 --batch_size 2
+```
+
+Run a CPU-friendly model forward smoke test:
+
+```bash
+python scripts/test_model_forward.py --config config/config2.json --device cpu
+```
+
+Generate TabPFN tabular embeddings when you want to use the original table branch:
+
+```bash
+python scripts/build_tabpfn_embeddings.py --table_csv adni_dataset/ADNI_Tabel.csv --out_csv adni_dataset/tabular_embeddings.csv
+```
+
+## Training
+
+中文完整命令说明见 [docs/main_training.txt](docs/main_training.txt)。
+
+Run the main model:
+
+```bash
+python MMHF.py
+```
+
+Run module ablations:
+
+```bash
+python experiments/run_ablation.py --experiment module_ablation --variant no_hattn
+python experiments/run_ablation.py --experiment module_ablation --variant no_hgc
+python experiments/run_ablation.py --experiment module_ablation --variant no_ce
+python experiments/run_ablation.py --experiment module_ablation --variant no_sl
+```
+
+Run modality ablations:
+
+```bash
+python experiments/run_ablation.py --experiment modality_ablation --variant mri
+python experiments/run_ablation.py --experiment modality_ablation --variant pet
+python experiments/run_ablation.py --experiment modality_ablation --variant table
+python experiments/run_ablation.py --experiment modality_ablation --variant mri_pet
+python experiments/run_ablation.py --experiment modality_ablation --variant mri_table
+python experiments/run_ablation.py --experiment modality_ablation --variant pet_table
+python experiments/run_ablation.py --experiment modality_ablation --variant mri_pet_table
+python experiments/run_ablation.py --experiment modality_ablation --variant table36
+```
+
+## External Validation
+
+Load a saved checkpoint and evaluate an external dataset with the same modality settings:
+
+```bash
+python scripts/external_validate.py --config config/config2.json --checkpoint checkpoints_mmad_mci/best_model_fold1.pth --label_file scan_dataset/labels.csv --mri_dir scan_dataset/MRI --pet_dir scan_dataset/PET --tabular_emb scan_dataset/tabular_embeddings.csv
+```

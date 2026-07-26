@@ -1,69 +1,91 @@
+"""TabPFN tabular embedding utilities.
+
+This module is optional: main training can consume a precomputed embedding CSV
+through ``cfg.tabular_emb``. Use this utility only when you need to regenerate
+those embeddings from the clinical table.
+"""
+
 from __future__ import annotations
 
+from typing import Optional, Sequence
+
 import numpy as np
+import pandas as pd
 
-from utils import TabPFNClassifier, TabPFNRegressor
 
-class TabPFNEmbedding:
+def _load_tabpfn(device: str):
+    try:
+        from tabpfn_extensions import TabPFNClassifier
+        from tabpfn_extensions.embedding import TabPFNEmbedding
+    except Exception as exc:
+        raise ImportError(
+            "TabPFN embedding generation requires tabpfn_extensions. "
+            "Install the same TabPFN stack used by the original project."
+        ) from exc
+    return TabPFNClassifier(device=device), TabPFNEmbedding
 
-    def __init__(
-        self,
-        tabpfn_clf: TabPFNClassifier | None = None,
-        tabpfn_reg: TabPFNRegressor | None = None,
-        n_fold: int = 0,
-    ) -> None:
-        self.tabpfn_clf = tabpfn_clf
-        self.tabpfn_reg = tabpfn_reg
-        self.model = self.tabpfn_clf if self.tabpfn_clf is not None else self.tabpfn_reg
-        self.n_fold = n_fold
 
-        if self.model is not None:
-            if "tabpfn_client" in str(self.model.__class__.__module__):
-                raise ImportError(
-                    "TabPFNEmbedding requires the full TabPFN implementation (pip install tabpfn). "
-                    "The TabPFN client (pip install tabpfn-client) does not support embedding extraction.",
-                )
+def _prepare_table(
+    csv_path: str,
+    label_col: str,
+    classes: Sequence[str],
+    *,
+    feature_cols: Optional[Sequence[str]] = None,
+    start_col: Optional[int] = None,
+    dropna: bool = False,
+) -> tuple[pd.DataFrame, list[str], np.ndarray, np.ndarray, np.ndarray]:
+    df = pd.read_csv(csv_path, encoding="ISO-8859-1")
+    id_col = df.columns[0]
+    if feature_cols is None:
+        if start_col is None:
+            raise ValueError("Provide feature_cols or start_col.")
+        feature_cols = [c for c in df.columns[start_col:] if c != label_col]
+    feature_cols = list(feature_cols)
 
-            if not hasattr(self.model, "get_embeddings"):
-                raise AttributeError(
-                    f"The provided model of type {type(self.model)} does not have a get_embeddings method. "
-                    "Make sure you're using the full TabPFN implementation (pip install tabpfn).",
-                )
+    df = df[df[label_col].isin(classes)].copy()
+    if df.empty:
+        raise ValueError(f"No rows for classes {list(classes)}.")
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> None:
-        if self.model is None:
-            raise ValueError("No model has been set.")
-        self.model.fit(X_train, y_train)
+    if dropna:
+        df = df.dropna(subset=[label_col, *feature_cols])
 
-    def get_embeddings(
-        self,
-        X_train: np.ndarray,
-        y_train: np.ndarray,
-        X: np.ndarray,
-        data_source: str,
-    ) -> np.ndarray:
-        if self.model is None:
-            raise ValueError("No model has been set.")
+    label_map = {name: i for i, name in enumerate(classes)}
+    subjects = df[id_col].astype(str).to_numpy()
+    y = df[label_col].map(label_map).astype("int64").to_numpy()
 
-        if self.n_fold == 0:
-            self.model.fit(X_train, y_train)
-            return self.model.get_embeddings(X, data_source=data_source)
-        elif self.n_fold >= 2:
-            if data_source == "test":
-                self.model.fit(X_train, y_train)
-                return self.model.get_embeddings(X, data_source=data_source)
-            else:
-                from sklearn.model_selection import KFold
+    for col in feature_cols:
+        if df[col].dtype == object or str(df[col].dtype).startswith("category"):
+            df[col] = pd.Categorical(df[col]).codes.astype("float32")
+    x = df[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0).astype("float32").to_numpy()
+    return df, feature_cols, subjects, x, y
 
-                kf = KFold(n_splits=self.n_fold, shuffle=False)
-                embeddings = []
-                for train_index, val_index in kf.split(X_train):
-                    X_train_fold, X_val_fold = X_train[train_index], X_train[val_index]
-                    y_train_fold, _y_val_fold = y_train[train_index], y_train[val_index]
-                    self.model.fit(X_train_fold, y_train_fold)
-                    embeddings.append(
-                        self.model.get_embeddings(X_val_fold, data_source="test"),
-                    )
-                return np.concatenate(embeddings, axis=1)
-        else:
-            raise ValueError("n_fold must be greater than 1.")
+
+def build_tabpfn_embeddings(
+    csv_path: str,
+    out_csv: str,
+    *,
+    label_col: str = "Group",
+    classes: Sequence[str] = ("SMCI", "PMCI"),
+    feature_cols: Optional[Sequence[str]] = None,
+    start_col: Optional[int] = 4,
+    device: str = "cuda:0",
+    dropna: bool = False,
+) -> pd.DataFrame:
+    """Generate one embedding CSV with ``Subject_ID``, ``label`` and embedding columns."""
+    _, _, subjects, x, y = _prepare_table(
+        csv_path,
+        label_col,
+        classes,
+        feature_cols=feature_cols,
+        start_col=start_col,
+        dropna=dropna,
+    )
+    clf, embedding_cls = _load_tabpfn(device)
+    embedder = embedding_cls(tabpfn_clf=clf, n_fold=0)
+    emb = embedder.get_embeddings(x, y, x, data_source="train")[0]
+
+    out = pd.DataFrame(emb)
+    out.insert(0, "label", y)
+    out.insert(0, "Subject_ID", subjects)
+    out.to_csv(out_csv, index=False)
+    return out
