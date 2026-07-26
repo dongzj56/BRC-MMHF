@@ -27,13 +27,13 @@ The default task is `SMCIPMCI`, with SMCI as class `0` and PMCI as class `1`.
 Check ADNI labels, modality alignment, AAL atlas, tabular preprocessing, fold split, and one MONAI batch:
 
 ```bash
-python datasets/test_dataset.py --config config/config2.json --fold 1 --batch_size 2
+python datasets/test_dataset.py --config config/config.json --fold 1 --batch_size 4
 ```
 
 Run a CPU-friendly model forward smoke test:
 
 ```bash
-python scripts/test_model_forward.py --config config/config2.json --device cpu
+python scripts/test_model_forward.py --config config/config.json --device cpu
 ```
 
 Generate TabPFN tabular embeddings when you want to use the original table branch:
@@ -44,8 +44,6 @@ python scripts/build_tabpfn_embeddings.py --table_csv adni_dataset/ADNI_Tabel.cs
 
 ## Training
 
-中文完整命令说明见 [docs/main_training.txt](docs/main_training.txt)。
-
 Run the main model:
 
 ```bash
@@ -55,23 +53,13 @@ python MMHF.py
 Run module ablations:
 
 ```bash
-python experiments/run_ablation.py --experiment module_ablation --variant no_hattn
-python experiments/run_ablation.py --experiment module_ablation --variant no_hgc
-python experiments/run_ablation.py --experiment module_ablation --variant no_ce
-python experiments/run_ablation.py --experiment module_ablation --variant no_sl
+python experiments/run_ablation.py --experiment module_ablation --variant no_[hattn/hgc/ce/sl]
 ```
 
 Run modality ablations:
 
 ```bash
-python experiments/run_ablation.py --experiment modality_ablation --variant mri
-python experiments/run_ablation.py --experiment modality_ablation --variant pet
-python experiments/run_ablation.py --experiment modality_ablation --variant table
-python experiments/run_ablation.py --experiment modality_ablation --variant mri_pet
-python experiments/run_ablation.py --experiment modality_ablation --variant mri_table
-python experiments/run_ablation.py --experiment modality_ablation --variant pet_table
-python experiments/run_ablation.py --experiment modality_ablation --variant mri_pet_table
-python experiments/run_ablation.py --experiment modality_ablation --variant table36
+python experiments/run_ablation.py --experiment modality_ablation --variant [mri/pet/table/mri_pet/mri_table/pet_table/mri_pet_table/table36]
 ```
 
 ## External Validation
@@ -79,5 +67,5 @@ python experiments/run_ablation.py --experiment modality_ablation --variant tabl
 Load a saved checkpoint and evaluate an external dataset with the same modality settings:
 
 ```bash
-python scripts/external_validate.py --config config/config2.json --checkpoint checkpoints_mmad_mci/best_model_fold1.pth --label_file scan_dataset/labels.csv --mri_dir scan_dataset/MRI --pet_dir scan_dataset/PET --tabular_emb scan_dataset/tabular_embeddings.csv
+python scripts/external_validate.py --config config/config.json --checkpoint checkpoints_mmad_mci/best_model_fold1.pth --label_file scan_dataset/labels.csv --mri_dir scan_dataset/MRI --pet_dir scan_dataset/PET --tabular_emb scan_dataset/tabular_embeddings.csv
 ```
